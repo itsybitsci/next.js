@@ -16,15 +16,15 @@ use std::{
     pin::Pin,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::SystemTime,
 };
 
 use anyhow::{Context, Result, bail};
 use auto_hash_map::{AutoMap, AutoSet};
-use gc::GC_ROOT_TTL;
 pub use gc::TtlCounter;
+use gc::{GC_ROOT_TTL, LastGcStats};
 use hashbrown::hash_table::Entry;
 use indexmap::IndexSet;
 use parking_lot::Mutex;
@@ -102,6 +102,21 @@ fn gc_enabled_from_env() -> bool {
     std::env::var_os("TURBO_ENGINE_GC")
         .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")))
 }
+
+/// How long a GC pass runs before it will honour an interrupt.
+///
+/// A GC pass holds total operation exclusion, so a waiting invalidation (an HMR edit) is stalled
+/// for its whole duration. The pass therefore watches
+/// [`SnapshotCoordinator::operations_waiting`](snapshot_coordinator::SnapshotCoordinator::operations_waiting)
+/// and winds down early when it is standing in someone's way — but not before this floor has
+/// elapsed. Without a floor, a dev server under sustained edits could interrupt every pass at its
+/// first job and never reclaim anything.
+///
+/// A *time* floor rather than a task count because the property we want is a bound on the stall
+/// itself: whatever the graph looks like, the worst case an edit can wait behind GC is roughly this
+/// plus the longest single task teardown. Overridable in tests/debugging via
+/// `TURBO_ENGINE_GC_MIN_PROGRESS_MS`.
+const GC_MIN_PROGRESS: Duration = Duration::from_millis(100);
 
 /// Priority used to re-schedule a task that became stale during execution.
 ///
@@ -261,6 +276,20 @@ pub struct TurboTasksBackend {
     /// "was not live in a whole session". See `gc_roots_refresh_and_age_out`.
     first_gc_pass_of_session: AtomicBool,
 
+    /// Test-only override of the GC min-progress floor, in milliseconds; `u64::MAX` means "unset"
+    /// (use [`GC_MIN_PROGRESS`] / the `TURBO_ENGINE_GC_MIN_PROGRESS_MS` env). Per-backend for the
+    /// same reason as `gc_root_ttl_override_ms`: parallel tests must not race a process-global.
+    /// `0` makes a pass interruptible immediately; `u64::MAX / 2` effectively disables
+    /// interruption (used by `gc_for_testing`, whose contract is a full pass). See
+    /// `set_gc_min_progress_for_testing`.
+    gc_min_progress_override_ms: AtomicU64,
+
+    /// Test-only record of the most recent GC pass. The production signal for these fields is the
+    /// `gc` span, which a unit test can't read; this lets a test assert on what the *pass* did
+    /// rather than on the resident count, which eviction also moves. See
+    /// `last_gc_stats_for_testing`.
+    last_gc_stats: Mutex<Option<LastGcStats>>,
+
     #[cfg(feature = "verify_aggregation_graph")]
     root_tasks: Mutex<FxHashSet<TaskId>>,
 }
@@ -335,6 +364,8 @@ impl TurboTasksBackend {
             backing_storage,
             gc_root_ttl,
             first_gc_pass_of_session: AtomicBool::new(true),
+            gc_min_progress_override_ms: AtomicU64::new(u64::MAX),
+            last_gc_stats: Mutex::new(None),
             #[cfg(feature = "verify_aggregation_graph")]
             root_tasks: Default::default(),
         }
@@ -419,6 +450,27 @@ impl TurboTasksBackend {
         self.storage
             .with_task(task, |t| t.gc_transient_ref_count())
             .unwrap_or(0)
+    }
+
+    /// Override the GC min-progress floor for this backend (milliseconds). `0` makes a pass
+    /// honour an interrupt from its very first job, which is what a test that wants to observe a
+    /// partial pass needs. Per-backend, so parallel tests don't race the global env. Test-only.
+    #[doc(hidden)]
+    pub fn set_gc_min_progress_for_testing(&self, min_progress_ms: u64) {
+        self.gc_min_progress_override_ms
+            .store(min_progress_ms, Ordering::Relaxed);
+    }
+
+    /// `(collected, abandoned, interrupted)` for the most recent GC pass run inside
+    /// `snapshot_and_persist`, or `None` if none has run. Test-only: production reads these off the
+    /// `gc` span. Lets a test assert on the pass itself rather than on the resident task count,
+    /// which eviction also moves and which therefore can't distinguish "GC collected it" from "GC
+    /// skipped it and eviction dropped it to disk".
+    #[doc(hidden)]
+    pub fn last_gc_stats_for_testing(&self) -> Option<(usize, usize, bool)> {
+        self.last_gc_stats
+            .lock()
+            .map(|s| (s.collected, s.abandoned, s.interrupted))
     }
 
     /// The GC roots set as currently persisted on disk (task id -> [`TtlCounter`]). Reads the
@@ -1125,6 +1177,7 @@ impl TurboTasksBackend {
             )
             .entered();
             let (stats, roots) = self.gc_collect(turbo_tasks, &snapshot_phase);
+            *self.last_gc_stats.lock() = Some((&stats).into());
             gc_span.record("stats", display(stats));
             gc_roots_to_persist = roots;
             Some(start.elapsed())

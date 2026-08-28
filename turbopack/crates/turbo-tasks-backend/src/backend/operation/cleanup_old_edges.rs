@@ -294,7 +294,13 @@ impl CleanupOldEdgesOperation {
                                 task: dependent_task_id,
                             }) => {
                                 {
-                                    let category = dependent_scrub_category(ctx);
+                                    // `collectibles_dependents` is Meta. A GC pass also wants
+                                    // the collectibility check, which additionally reads Data.
+                                    let category = if ctx.collects_gc_candidates() {
+                                        TaskDataCategory::All
+                                    } else {
+                                        TaskDataCategory::Meta
+                                    };
                                     let mut task = ctx.task(dependent_task_id, category);
                                     let removed = task.remove_collectibles_dependents(&(
                                         collectible_type,

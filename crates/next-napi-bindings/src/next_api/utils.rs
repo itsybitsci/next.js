@@ -43,8 +43,9 @@ use crate::next_api::turbopack_ctx::NextTurbopackContext;
 /// [`turbo_tasks::OperationValue`] and should be dereferenced to an [`OperationVc`] before being
 /// passed to a [`turbo_tasks::function`].
 //
-// TODO: If we add a tracing garbage collector to turbo-tasks, this should be tracked as a GC root.
-#[derive(Clone)]
+/// A `DetachedVc` holds its operation's task alive against garbage collection for as long as the
+/// handle exists: it is a reference that escapes the tracked task graph, so no persistent parent
+/// lists the task as a child and GC would otherwise collect it.
 pub struct DetachedVc<T> {
     turbopack_ctx: NextTurbopackContext,
     /// The Vc. Must be unresolved, otherwise you are referencing an inactive operation.
@@ -53,11 +54,28 @@ pub struct DetachedVc<T> {
 
 impl<T> DetachedVc<T> {
     pub fn new(turbopack_ctx: NextTurbopackContext, vc: OperationVc<T>) -> Self {
+        // Pin the operation's task so GC treats this out-of-graph handle as a root.
+        turbopack_ctx.turbo_tasks().pin_task_for_gc(vc.task_id());
+
         Self { turbopack_ctx, vc }
     }
 
     pub fn turbopack_ctx(&self) -> &NextTurbopackContext {
         &self.turbopack_ctx
+    }
+}
+
+impl<T> Clone for DetachedVc<T> {
+    fn clone(&self) -> Self {
+        Self::new(self.turbopack_ctx.clone(), self.vc)
+    }
+}
+
+impl<T> Drop for DetachedVc<T> {
+    fn drop(&mut self) {
+        self.turbopack_ctx
+            .turbo_tasks()
+            .unpin_task_for_gc(self.task_id());
     }
 }
 
@@ -73,12 +91,10 @@ impl<T> Deref for DetachedVc<T> {
 /// [`turbo_tasks::TurboTasks::spawn_root_task`] that can be passed back and forth to JS across the
 /// [`napi`][mod@napi] boundary via [`External`].
 ///
-/// JavaScript code receiving this value **must** call [`root_task_dispose`] in a `try...finally`
-/// block to avoid leaking root tasks.
+/// JavaScript code should call [`root_task_dispose`] in a `try...finally` block to dispose the root
+/// task promptly. If it doesn't, [`Drop`] disposes it as a backstop.
 ///
 /// This is used by [`subscribe`] to create a computation that re-executes when dependencies change.
-//
-// TODO: If we add a tracing garbage collector to turbo-tasks, this should be tracked as a GC root.
 pub struct RootTask {
     turbopack_ctx: NextTurbopackContext,
     task_id: Option<TaskId>,
@@ -86,7 +102,10 @@ pub struct RootTask {
 
 impl Drop for RootTask {
     fn drop(&mut self) {
-        // TODO stop the root task
+        // Tear it down now if `root_task_dispose` wasn't called.
+        if let Some(task) = self.task_id.take() {
+            self.turbopack_ctx.turbo_tasks().dispose_root_task(task);
+        }
     }
 }
 

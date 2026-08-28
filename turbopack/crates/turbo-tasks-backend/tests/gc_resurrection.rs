@@ -14,34 +14,18 @@
 //! subtree must also be disconnected *cleanly* — drop the parent's reference, don't invalidate,
 //! since invalidation runs `cleanup_old_edges` and strips the outgoing deps first.
 
+mod gc_fixture;
 mod util;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Result;
-use turbo_tasks::{ResolvedVc, State, Vc};
+use turbo_tasks::{ResolvedVc, Vc};
 
-use crate::util::create_tt;
-
-#[turbo_tasks::value(transparent)]
-struct Selector(State<bool>);
-
-#[turbo_tasks::function(operation, root)]
-fn create_selector(initial: bool) -> Vc<Selector> {
-    Selector(State::new(initial)).cell()
-}
-
-/// A long-lived State whose *value never changes*, read by the leaves purely to make each leaf
-/// **mutable**, so a reader records a real dependency edge on it. The state task is a root and
-/// stays alive; the leaves reach it via a dependency edge, not a child edge, so disconnecting the
-/// leaves as children still lets them lose activeness.
-#[turbo_tasks::value(transparent)]
-struct Constant(State<u32>);
-
-#[turbo_tasks::function(operation, root)]
-fn create_constant() -> Vc<Constant> {
-    Constant(State::new(0)).cell()
-}
+use crate::{
+    gc_fixture::{Constant, Selector, create_constant, create_selector, diamond_root},
+    util::create_tt,
+};
 
 /// The forward-dependency *target*: mutable because it reads `constant`'s State. `FANOUT` distinct
 /// leaves per reader give many chances for the racing interleaving.
@@ -51,6 +35,10 @@ async fn sd_leaf(constant: ResolvedVc<Constant>, index: u32) -> Result<Vc<u32>> 
     Ok(Vc::cell(base.wrapping_add(index)))
 }
 
+/// Width of the reader/diamond subtrees. These tests are race tests — the wider the subtree, the
+/// more chances for the interleaving under test — so this is set well above the minimum that
+/// *describes* the shape. It is free to keep it high: this binary runs in ~0.2s either way, and
+/// dropping to 128 measured no faster.
 const FANOUT: u32 = 400;
 
 /// The *reader* `S`: reads every `sd_leaf`, so it (a) connects each leaf as a child and (b) records
@@ -62,38 +50,6 @@ async fn reader(constant: ResolvedVc<Constant>) -> Result<Vc<u32>> {
     let mut sum = 0u32;
     for index in 0..FANOUT {
         sum = sum.wrapping_add(*sd_leaf(*constant, index).await?);
-    }
-    Ok(Vc::cell(sum))
-}
-
-/// A *sibling* forward-dependency target for the diamond fixture (`B`).
-#[turbo_tasks::function]
-async fn diamond_target(constant: ResolvedVc<Constant>, index: u32) -> Result<Vc<u32>> {
-    let base = *constant.await?.get();
-    Ok(Vc::cell(base.wrapping_add(index).wrapping_mul(7)))
-}
-
-/// A diamond *reader* (`A`): reads the cell of a `diamond_target` (`B`) that is **passed in as an
-/// already-resolved `Vc`** — so `A` records a forward (cell) dependency on `B` WITHOUT connecting
-/// `B` as `A`'s child (a child edge is only created by *calling* a task; here `B` was called by
-/// `diamond_root`). This decoupling is the crux: `B`'s only parent is `diamond_root`, so when the
-/// root is collected BOTH `A` and `B` reach `parent_count 0` at the same time and cascade-collect
-/// concurrently — while `A` still holds a forward-dep on `B` to scrub.
-#[turbo_tasks::function]
-async fn diamond_reader(target: ResolvedVc<u32>) -> Result<Vc<u32>> {
-    Ok(Vc::cell(1 + *target.await?))
-}
-
-/// The diamond root: parents both `A` and `B` as siblings, so collecting the root cascades a
-/// `Collect` for every `A` and `B` at once — a `B` can therefore be collected before the
-/// `Collect(A)` whose `CleanupOldEdges` opens it.
-#[turbo_tasks::function]
-async fn diamond_root(constant: ResolvedVc<Constant>) -> Result<Vc<u32>> {
-    let mut sum = 0u32;
-    for index in 0..FANOUT {
-        let target = diamond_target(*constant, index).to_resolved().await?;
-        sum = sum.wrapping_add(*target.await?);
-        sum = sum.wrapping_add(*diamond_reader(*target).await?);
     }
     Ok(Vc::cell(sum))
 }
@@ -125,7 +81,7 @@ async fn select_diamond(
 ) -> Result<Vc<u32>> {
     let use_diamond = !*selector.await?.get();
     let value = if use_diamond {
-        *diamond_root(*constant).await?
+        *diamond_root(*constant, FANOUT).await?
     } else {
         0u32
     };
@@ -178,6 +134,24 @@ async fn gc_rebalances_aggregation_and_cascades_in_one_pass() {
         after,
         baseline - (FANOUT as usize + 1),
         "resident count must drop by exactly the collected subtree"
+    );
+
+    // No task from the collected subtree may have been recorded as a GC root: a leaf that reached
+    // the post-drain scan still holding its dangling `upper` edge to the deleted `reader` would
+    // land in the persisted roots map as `MostRecent`, which never ages out.
+    //
+    // The map is expected to be non-empty — the three `(operation, root)` tasks read at the top
+    // level of the `run_once` are parentless and anchored by the transient `Once` task, which is
+    // exactly what a GC root is. The subtree is `FANOUT` leaves wide, far more than this bound of
+    // 3, so a leaked leaf could not hide under it.
+    //
+    // If this ever fires it is a finding about the aggregation graph — an edge outliving the task
+    // it points at — not a reason to narrow `gc_is_root`.
+    let roots = tt2.backend().persisted_gc_roots_for_testing();
+    assert!(
+        roots.len() <= 3,
+        "only the top-level operation roots should be tracked, got {} entries: {roots:?}",
+        roots.len()
     );
 
     tt.stop_and_wait().await;

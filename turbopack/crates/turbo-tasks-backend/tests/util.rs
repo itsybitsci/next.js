@@ -6,8 +6,12 @@
 //! `Arc<dyn TurboTasksApi>`, which erases the concrete backend type and makes `tt.backend()`
 //! unreachable. It also owns the session loop (re-running the body and comparing results), whereas
 //! these tests need to drive snapshots — and sometimes a DB reopen — on their own schedule.
+//!
+//! This module is compiled into each test binary separately, so any helper a given binary doesn't
+//! call reads as dead code there.
+#![allow(dead_code)]
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use turbo_tasks::TurboTasks;
 use turbo_tasks_backend::{
@@ -19,6 +23,25 @@ use turbo_tasks_backend::{
 /// Reusing the same `path` (after the previous backend has been stopped) reopens the persisted
 /// database, which is how a test can assert that state survives a restart.
 fn open_tt_at(path: &Path, num_workers: usize) -> Arc<TurboTasks<TurboTasksBackend>> {
+    // GC on by default: these are the GC tests, and `gc_for_testing` asserts the backend is
+    // GC-enabled. Per-backend rather than via `TURBO_ENGINE_GC`, which every test in the binary
+    // would share.
+    open_tt_at_with_gc(path, num_workers, Some(true), None)
+}
+
+/// Like [`open_tt_at`], but forces the GC on or off for this backend instead of deriving it from
+/// the `TURBO_ENGINE_GC` env var.
+///
+/// A test that depends on the **persisted GC roots map** must force it on: the map is only written
+/// by the GC branch of `snapshot_and_persist`, so with GC off a session persists an empty root set
+/// and the cross-session behaviour under test silently never engages. Forcing it per-backend keeps
+/// it off the process environment, which every test in the binary shares.
+fn open_tt_at_with_gc(
+    path: &Path,
+    num_workers: usize,
+    gc: Option<bool>,
+    gc_root_ttl: Option<Duration>,
+) -> Arc<TurboTasks<TurboTasksBackend>> {
     TurboTasks::new(TurboTasksBackend::new(
         BackendOptions {
             num_workers: Some(num_workers),
@@ -27,9 +50,8 @@ fn open_tt_at(path: &Path, num_workers: usize) -> Arc<TurboTasks<TurboTasksBacke
             // snapshot_and_evict_for_testing manually.
             storage_mode: Some(turbo_tasks_backend::StorageMode::ReadWriteOnShutdown),
             eviction_mode: EvictionMode::Full,
-            // `gc_for_testing` requires a GC-enabled backend. Set per-backend rather than via
-            // `TURBO_ENGINE_GC` so parallel tests in the same binary don't share the setting.
-            gc: Some(true),
+            gc,
+            gc_root_ttl,
             ..Default::default()
         },
         turbo_tasks_backend::turbo_backing_storage(
@@ -49,15 +71,40 @@ fn open_tt_at(path: &Path, num_workers: usize) -> Arc<TurboTasks<TurboTasksBacke
     ))
 }
 
+/// A persistence directory that outlives the backends opened on it, so a test can stop one backend
+/// and open another on the same path to simulate a restart. Pair with [`reopen_tt_with_gc`].
+pub fn create_persistence_dir(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("{name}-"))
+        .tempdir()
+        .unwrap()
+}
+
+/// Opens a backend on an existing persistence directory — a new *session* over the same database —
+/// with the GC forced on, for tests that assert on cross-session root behaviour. The previous
+/// backend must already be stopped (`stop_and_wait`) so its shutdown snapshot has been flushed.
+///
+/// See [`open_tt_at_with_gc`] for why forcing the GC here rather than via the env var matters.
+pub fn reopen_tt_with_gc(dir: &tempfile::TempDir) -> Arc<TurboTasks<TurboTasksBackend>> {
+    open_tt_at_with_gc(dir.path(), 2, Some(true), None)
+}
+
+/// [`reopen_tt_with_gc`] with the GC root TTL pinned, so a cross-session test can age a root out
+/// inside the test rather than days later. Set at construction because the TTL is resolved once
+/// when the backend is built.
+pub fn reopen_tt_with_gc_ttl(
+    dir: &tempfile::TempDir,
+    gc_root_ttl: Duration,
+) -> Arc<TurboTasks<TurboTasksBackend>> {
+    open_tt_at_with_gc(dir.path(), 2, Some(true), Some(gc_root_ttl))
+}
+
 /// A fresh persistent backend in its own temp directory, with `num_workers` workers.
 pub fn create_tt_with_workers(
     name: &str,
     num_workers: usize,
 ) -> (Arc<TurboTasks<TurboTasksBackend>>, tempfile::TempDir) {
-    let dir = tempfile::Builder::new()
-        .prefix(&format!("{name}-"))
-        .tempdir()
-        .unwrap();
+    let dir = create_persistence_dir(name);
     let tt = open_tt_at(dir.path(), num_workers);
     (tt, dir)
 }

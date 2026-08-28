@@ -898,6 +898,20 @@ impl TaskStorage {
                         .cell_dependents_hashed()
                         .is_none_or(|d| d.is_empty())))
     }
+
+    /// Whether the garbage collector has soft-deleted this task (see the `deleted` flag). Used
+    /// after a GC pass drains to tell which of the pass's GC roots were collected.
+    pub fn is_gc_deleted(&self) -> bool {
+        self.flags.deleted()
+    }
+
+    /// Whether this task is a GC **root**: parent-less, but pinned for some reason
+    pub fn gc_is_root(&self) -> bool {
+        self.flags.is_restored(TaskDataCategory::Meta)
+            && !self.flags.deleted()
+            && self.gc_parent_count() == 0
+            && !self.gc_maybe_collectible()
+    }
 }
 
 /// Counts for aggregation tree and collectibles fields.

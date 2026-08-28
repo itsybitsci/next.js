@@ -12,23 +12,48 @@
 //! that could resurrect a task mid-collect, and hand its decisions straight to persistence: the
 //! same guard stays held across the snapshot that writes the tombstones.
 //!
-//! TODO: find a way to collect GC roots that go away between sessions.  Right now they are
-//! persisted forever and if a later session doesn't read them it is never deleted.
+//! A pass has two phases: a fully parallel, unbounded job pool that tears down garbage, followed by
+//! a single scan that classifies GC roots once the graph is quiescent (see
+//! [`TurboTasksBackend::gc_collect`]).
 
-use std::{fmt::Display, ops::ControlFlow, sync::atomic::Ordering};
+use std::{
+    fmt::Display,
+    ops::ControlFlow,
+    sync::atomic::Ordering,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
+use bincode::{Decode, Encode};
+use rustc_hash::FxHashMap;
 use turbo_tasks::{TaskId, TurboTasks, scope_unbounded::scope_unbounded_with};
 
-use crate::backend::{
-    AnyOperation, TurboTasksBackend,
-    operation::{
-        AggregationUpdateQueue, CleanupOldEdgesOperation, ExecuteContext, ExecuteContextImpl,
-        TaskGuard, capture_all_outgoing_edges,
+use crate::{
+    backend::{
+        AnyOperation, TurboTasksBackend,
+        operation::{
+            AggregationUpdateQueue, CleanupOldEdgesOperation, ExecuteContext, ExecuteContextImpl,
+            TaskGuard, capture_all_outgoing_edges,
+        },
+        snapshot_coordinator::SnapshotPhase,
+        storage::{SpecificTaskDataCategory, TaskDataCategory},
+        storage_schema::TaskStorageAccessors,
     },
-    snapshot_coordinator::SnapshotPhase,
-    storage::{SpecificTaskDataCategory, TaskDataCategory},
-    storage_schema::TaskStorageAccessors,
+    backing_storage::SnapshotItem,
 };
+
+/// How long a GC root may go un-anchored before it is collected.
+/// Default to 3 days so that a root that is at least occasionanally used can survive a weekend.
+pub(crate) const GC_ROOT_TTL: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// How long a GC root has gone without being observed live, as stored in the persisted roots map.
+#[derive(Encode, Decode, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TtlCounter {
+    /// Observed live (a durable, anchored root) in the most recent session.
+    MostRecent,
+    /// The timestamp of the first time we observed the root as not live.  This starts a TTL
+    /// counter.
+    FirstStale(u64),
+}
 
 /// One unit of GC work.
 enum GcJob {
@@ -42,19 +67,26 @@ enum GcJob {
 /// Observability counters for one [`TurboTasksBackend::gc_collect`] pass.
 #[derive(Default)]
 pub(crate) struct GcStats {
+    /// Number of roots detected by the pass
+    pub gc_roots: usize,
     /// Tasks collected (marked soft-deleted).
     pub collected: usize,
     /// Edges torn down across all collected tasks (children + forward-dependency reverse edges).
     pub edges_deleted: usize,
+    /// Cross-session roots that aged out past the TTL.
+    pub aged_out_roots: usize,
 }
 
 impl Display for GcStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "collected: {collected}, edges_deleted: {edges_deleted}",
+            "gc_roots = {gc_roots}, collected: {collected}, edges_deleted: {edges_deleted}, \
+             aged_out_roots = {aged_out_roots}",
+            gc_roots = self.gc_roots,
             collected = self.collected,
-            edges_deleted = self.edges_deleted
+            edges_deleted = self.edges_deleted,
+            aged_out_roots = self.aged_out_roots
         )
     }
 }
@@ -63,6 +95,8 @@ impl GcStats {
     fn merge(mut self, other: Self) -> Self {
         self.collected += other.collected;
         self.edges_deleted += other.edges_deleted;
+        self.gc_roots += other.gc_roots;
+        self.aged_out_roots += other.aged_out_roots;
         self
     }
 }
@@ -78,10 +112,31 @@ impl TurboTasksBackend {
         &self,
         turbo_tasks: &TurboTasks<TurboTasksBackend>,
         phase: &SnapshotPhase<'_, AnyOperation>,
-    ) -> GcStats {
+    ) -> (GcStats, Option<Vec<(TaskId, TtlCounter)>>) {
+        let now = Self::now_ms();
+
+        let mut roots = self
+            .backing_storage
+            .roots()
+            .unwrap_or_else(|err| {
+                // A corrupt/unreadable roots key shouldn't abort GC.
+                eprintln!("failed to read GC roots, treating as empty: {err:?}");
+                Vec::new()
+            })
+            .into_iter()
+            .collect::<FxHashMap<TaskId, TtlCounter>>();
+        let roots_before = roots.clone();
+
+        let first_pass_of_session = self.first_gc_pass_of_session.swap(false, Ordering::Relaxed);
+        let aged_out = self.gc_roots_refresh_and_age_out(&mut roots, now, first_pass_of_session);
+
+        let aged_out_count = aged_out.len();
         // TODO(perf): recycle the task ids of collected tasks.
-        scope_unbounded_with(
-            (0..self.storage.shard_count()).map(GcJob::ScanShard),
+        let mut stats: GcStats = scope_unbounded_with(
+            // Start by scanning all shards and collecting the aged out roots from prior sessions
+            (0..self.storage.shard_count())
+                .map(GcJob::ScanShard)
+                .chain(aged_out.into_iter().map(GcJob::Collect)),
             GcStats::default,
             |spawner, job, stats| {
                 let collector = |task_id| spawner.spawn(GcJob::Collect(task_id));
@@ -132,7 +187,77 @@ impl TurboTasksBackend {
                 ControlFlow::Continue(())
             },
             GcStats::merge,
-        )
+        );
+
+        // Drop the entries for tasks this pass collected.
+        roots.retain(|&id, _| {
+            self.storage
+                // retain roots that are not deleted by the above
+                .with_task(id, |storage| !storage.is_gc_deleted())
+                // or are not resident in memory (only aging out will drop them and that already
+                // happened)
+                .unwrap_or(true)
+        });
+
+        // Collect all active roots
+        for id in self.storage.gc_scan_roots() {
+            roots.insert(id, TtlCounter::MostRecent);
+        }
+
+        stats.gc_roots = roots.len();
+        stats.aged_out_roots = aged_out_count;
+
+        // Only persist the roots map if it actually changed
+        let roots_to_persist: Option<Vec<_>> =
+            (roots != roots_before).then(|| roots.into_iter().collect());
+        (stats, roots_to_persist)
+    }
+
+    /// Wall-clock now as millis since the Unix epoch.
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Update root TTLs and compute tasks that have aged out.
+    fn gc_roots_refresh_and_age_out(
+        &self,
+        map: &mut FxHashMap<TaskId, TtlCounter>,
+        now: u64,
+        first_pass_of_session: bool,
+    ) -> Vec<TaskId> {
+        let ttl_ms = self.gc_root_ttl.as_millis() as u64;
+
+        let mut aged_out = Vec::new();
+        for (id, counter) in map.iter_mut() {
+            let is_live_root = self
+                .storage
+                .with_task(*id, |t| t.gc_is_root())
+                .unwrap_or(false);
+            if is_live_root {
+                *counter = TtlCounter::MostRecent;
+            } else {
+                match *counter {
+                    TtlCounter::MostRecent => {
+                        // It isn't currently live, so mark it stale if this is the first pass in
+                        // the session
+                        if first_pass_of_session {
+                            *counter = TtlCounter::FirstStale(now);
+                        }
+                    }
+                    TtlCounter::FirstStale(since) => {
+                        // Check TTLs
+                        if now.saturating_sub(since) > ttl_ms {
+                            aged_out.push(*id);
+                        }
+                    }
+                }
+            }
+        }
+
+        aged_out
     }
 
     pub(super) fn pin_task_for_gc(
@@ -186,6 +311,23 @@ impl TurboTasksBackend {
         );
         let _serialize = self.snapshot_in_progress.lock();
         let phase = self.snapshot_coord.begin_snapshot();
-        self.gc_collect(turbo_tasks, &phase).collected
+        let (stats, roots) = self.gc_collect(turbo_tasks, &phase);
+
+        // Persist the roots map this pass produced. Production does this by holding the same
+        // exclusion across the GC pass and the snapshot that follows it; this hook has no
+        // snapshot. Dropping the result would not merely lose an optimization: the pass also
+        // consumed the session's one demotion opportunity (`first_gc_pass_of_session`), so a root
+        // that went stale this session would stay `MostRecent` with no later pass able to demote
+        // it.
+        if let Some(roots) = roots
+            && let Err(err) = self.backing_storage.save_snapshot(
+                Vec::new(),
+                Some(roots),
+                Vec::<Vec<SnapshotItem>>::new(),
+            )
+        {
+            panic!("gc_for_testing: failed to persist GC roots: {err:?}");
+        }
+        stats.collected
     }
 }

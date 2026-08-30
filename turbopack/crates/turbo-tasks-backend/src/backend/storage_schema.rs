@@ -18,21 +18,22 @@
 //! - `meta` - Rarely changed metadata (output, aggregation, flags)
 //! - `transient` - Not serialized, only exists in memory
 use std::{
+    fmt,
     hash::{BuildHasherDefault, Hash},
     sync::Arc,
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RawMutex, lock_api::RawMutex as RawMutexTrait};
 use rustc_hash::FxHasher;
 use turbo_tasks::{
-    CellId, SharedReference, TaskExecutionReason, TaskId, TraitTypeId, ValueTypeId,
+    CellId, SharedReference, ShrinkToFit, TaskExecutionReason, TaskId, TraitTypeId, ValueTypeId,
     backend::{CachedTaskTypeArc, CellHash, TransientTaskType},
     event::Event,
     task_storage,
 };
 
 use crate::{
-    backend::{cell_data::CellData, counter_map::CounterMap},
+    backend::{cell_data::CellData, counter_map::CounterMap, dense_task_map::TaskSlotValue},
     data::{
         ActivenessState, AggregationNumber, CellRef, CollectibleRef, CollectiblesRef, Dirtyness,
         InProgressCellState, InProgressState, LeafDistance, OutputValue, RootType, TransientTask,
@@ -46,6 +47,48 @@ type AutoSet<K, const I: usize> = auto_hash_map::AutoSet<K, BuildHasherDefault<F
 ///
 /// See [`AutoSet`] for the meaning of `I`.
 type AutoMap<K, V, const I: usize> = auto_hash_map::AutoMap<K, V, BuildHasherDefault<FxHasher>, I>;
+
+/// Intrusive parking_lot lock embedded in each always-initialized task slot.
+pub(crate) struct IntrusiveTaskLock(RawMutex);
+
+impl IntrusiveTaskLock {
+    pub(crate) const fn new() -> Self {
+        Self(<RawMutex as RawMutexTrait>::INIT)
+    }
+
+    pub(crate) fn lock(&self) {
+        self.0.lock();
+    }
+
+    /// # Safety
+    ///
+    /// The caller must own this lock and must not access the protected task after unlocking.
+    pub(crate) unsafe fn unlock(&self) {
+        // SAFETY: Forwarded from the caller.
+        unsafe { self.0.unlock() };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_locked(&self) -> bool {
+        self.0.is_locked()
+    }
+}
+
+impl Default for IntrusiveTaskLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for IntrusiveTaskLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IntrusiveTaskLock").finish_non_exhaustive()
+    }
+}
+
+impl ShrinkToFit for IntrusiveTaskLock {
+    fn shrink_to_fit(&mut self) {}
+}
 
 /// The complete task storage schema.
 ///
@@ -554,7 +597,63 @@ pub enum KeyEvictability {
     Unevictable,
 }
 
+// SAFETY: `TaskStorage::empty_slot` always initializes the raw mutex. Dense chunks pin every slot
+// after publication, and `take_and_vacate` moves only payload fields while preserving that mutex.
+unsafe impl TaskSlotValue for TaskStorage {
+    const EMPTY: Self = Self::empty_slot();
+
+    fn lock(&self) {
+        self.lock.lock();
+    }
+
+    unsafe fn unlock(&self) {
+        // SAFETY: Forwarded from the intrusive slot guard that owns this lock.
+        unsafe { self.lock.unlock() };
+    }
+
+    fn is_occupied(&self) -> bool {
+        self.is_occupied()
+    }
+
+    fn occupy(&mut self) {
+        self.occupy();
+    }
+
+    fn take_and_vacate(&mut self) -> Self {
+        self.take_and_vacate()
+    }
+
+    fn vacate_in_place(&mut self) {
+        self.vacate_in_place();
+    }
+}
+
 impl TaskStorage {
+    /// Canonical const representation of a vacant, always-initialized dense task slot.
+    pub const fn empty_slot() -> Self {
+        Self {
+            leaf_distance: LeafDistance {
+                distance: 0,
+                max_distance_in_buffer: 0,
+            },
+            aggregation_number: AggregationNumber {
+                base: 0,
+                distance: 0,
+                effective: 0,
+            },
+            output_dependent: AutoSet::with_hasher(),
+            output: None,
+            upper: CounterMap::new(),
+            parent_count: 0,
+            transient_ref_count: 0,
+            persistent_task_type: None,
+            flags: TaskFlags::empty(),
+            lazy: TinyVec::new(),
+            lock: IntrusiveTaskLock::new(),
+            occupied: false,
+        }
+    }
+
     /// Determine the evictability level of this task based on its flags.
     ///
     /// This checks only the flags on the TaskStorage itself. The caller
@@ -1007,14 +1106,14 @@ impl<K: IsTransient + Hash + Eq, V: IsTransient, const I: usize> DropPartial for
 }
 #[cfg(test)]
 mod tests {
-    use std::mem::size_of;
+    use std::{mem::size_of, sync::atomic::AtomicU64};
 
-    use parking_lot::Mutex;
+    use parking_lot::{Mutex, RawMutex};
     use turbo_tasks::{CellId, TaskId};
 
     use super::*;
     use crate::{
-        backend::dense_task_map::{CHUNK_SIZE, TaskChunk},
+        backend::dense_task_map::{BITMAP_WORDS, CHUNK_SIZE, TaskChunk, TaskSlot},
         data::{AggregationNumber, CellRef, Dirtyness, OutputValue},
     };
 
@@ -1749,6 +1848,69 @@ mod tests {
     // ==========================================================================
 
     #[test]
+    fn const_empty_slots_have_independent_unlocked_mutexes() {
+        let empty_task = const { TaskStorage::empty_slot() };
+        let slots = [const { TaskStorage::empty_slot() }; 2];
+        assert!(!empty_task.is_occupied());
+        assert!(!slots[0].is_occupied());
+        assert!(!slots[1].is_occupied());
+        assert!(!slots[0].lock.is_locked());
+        assert!(!slots[1].lock.is_locked());
+        slots[0].lock.lock();
+        assert!(slots[0].lock.is_locked());
+        assert!(!slots[1].lock.is_locked());
+        // SAFETY: This thread acquired the lock above and does not access protected state after.
+        unsafe { slots[0].lock.unlock() };
+    }
+
+    #[test]
+    fn vacate_preserves_lock_and_resets_payload() {
+        let mut task = TaskStorage::empty_slot();
+        let lock_address = std::ptr::addr_of!(task.lock);
+        task.lock.lock();
+        task.occupy();
+        task.set_output(OutputValue::Output(TaskId::new(1).unwrap()));
+        let detached = task.take_and_vacate();
+        assert_eq!(std::ptr::addr_of!(task.lock), lock_address);
+        assert!(task.lock.is_locked());
+        assert!(!task.is_occupied());
+        assert_eq!(task.get_output(), None);
+        assert_eq!(
+            detached.get_output(),
+            Some(&OutputValue::Output(TaskId::new(1).unwrap()))
+        );
+        assert!(!detached.lock.is_locked());
+        assert!(!detached.is_occupied());
+        // SAFETY: This thread acquired the source lock and no protected access follows.
+        unsafe { task.lock.unlock() };
+        task.lock.lock();
+        task.occupy();
+        task.set_output(OutputValue::Output(TaskId::new(2).unwrap()));
+        assert!(task.is_occupied());
+        task.vacate_in_place();
+        assert!(task.lock.is_locked());
+        assert!(!task.is_occupied());
+        assert_eq!(task.get_output(), None);
+        // SAFETY: This thread acquired the reused slot lock above.
+        unsafe { task.lock.unlock() };
+    }
+
+    #[test]
+    fn snapshot_clone_has_fresh_synchronization_state() {
+        let mut task = TaskStorage::empty_slot();
+        task.lock.lock();
+        task.occupy();
+        task.set_output(OutputValue::Output(TaskId::new(1).unwrap()));
+        let snapshot = task.clone_snapshot();
+        assert!(task.lock.is_locked());
+        assert!(!snapshot.lock.is_locked());
+        assert!(!snapshot.is_occupied());
+        assert_eq!(snapshot.get_output(), task.get_output());
+        // SAFETY: This thread acquired the source lock above.
+        unsafe { task.lock.unlock() };
+    }
+
+    #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_schema_size() {
         assert_eq!(
@@ -1771,14 +1933,30 @@ mod tests {
             136,
             "inline task slot size changed"
         );
+        assert_eq!(size_of::<RawMutex>(), 1, "parking_lot RawMutex grew");
         assert_eq!(
-            size_of::<TaskChunk<TaskStorage>>(),
-            16,
-            "chunk header size changed"
+            size_of::<IntrusiveTaskLock>(),
+            1,
+            "intrusive lock wrapper grew"
         );
         assert_eq!(
-            size_of::<[Mutex<Option<TaskStorage>>; CHUNK_SIZE]>(),
-            136 * CHUNK_SIZE,
+            size_of::<TaskSlot<TaskStorage>>(),
+            128,
+            "intrusive task slot must not add padding"
+        );
+        assert_eq!(
+            size_of::<[AtomicU64; BITMAP_WORDS]>(),
+            128,
+            "chunk occupancy bitmap size changed"
+        );
+        assert_eq!(
+            size_of::<TaskChunk<TaskStorage>>(),
+            144,
+            "chunk header and bitmap size changed"
+        );
+        assert_eq!(
+            size_of::<[TaskSlot<TaskStorage>; CHUNK_SIZE]>(),
+            128 * CHUNK_SIZE,
             "chunk slot allocation size changed"
         );
         // `LazyField` is 40 B = 32 B largest payload + 8 B discriminant.

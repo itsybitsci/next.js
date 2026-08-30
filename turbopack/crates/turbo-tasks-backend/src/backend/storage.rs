@@ -284,21 +284,22 @@ impl Storage {
 
             let work = if drain_entries {
                 let mut entries = Vec::with_capacity(modified_count as usize);
-                for offset in 0..crate::backend::dense_task_map::CHUNK_SIZE {
-                    chunk.update_slot(offset, |slot| {
-                        let Some(task) = slot.take() else {
-                            return;
-                        };
-                        if task.flags.any_modified() {
-                            let task_id = chunk.task_id(offset);
-                            debug_assert!(
-                                !task_id.is_transient(),
-                                "found a modified transient task: {task_id:?}"
-                            );
-                            entries.push((task_id, task));
-                        }
-                        // Unmodified tasks, including all transient tasks, are dropped here.
-                    });
+                for offset in chunk.chunk.probably_occupied_offsets() {
+                    let Some(task) = chunk.get(offset) else {
+                        continue;
+                    };
+                    if task.flags.any_modified() {
+                        let task_id = *task.key();
+                        debug_assert!(
+                            !task_id.is_transient(),
+                            "found a modified transient task: {task_id:?}"
+                        );
+                        entries.push((task_id, task.take_and_vacate()));
+                    } else {
+                        // Unmodified tasks, including all transient tasks, can reset in place;
+                        // only modified tasks need a detached value for persistence.
+                        task.vacate();
+                    }
                 }
                 if entries.is_empty() {
                     return None;
@@ -306,13 +307,12 @@ impl Storage {
                 ShardWork::Drain(entries.into_iter())
             } else {
                 let mut modified = Vec::with_capacity(modified_count as usize);
-                for (offset, slot) in chunk.chunk.slots().iter().enumerate() {
-                    let task = slot.lock();
-                    let Some(task) = task.as_ref() else {
+                for offset in chunk.chunk.probably_occupied_offsets() {
+                    let Some(task) = chunk.get(offset) else {
                         continue;
                     };
                     if task.flags.any_modified() {
-                        let task_id = chunk.task_id(offset);
+                        let task_id = *task.key();
                         debug_assert!(
                             !task_id.is_transient(),
                             "found a modified transient task: {task_id:?}"
@@ -412,7 +412,7 @@ impl Storage {
         let inner = self
             .map
             .get(key)
-            .unwrap_or_else(|| self.map.get_or_insert_with(key, TaskStorage::new));
+            .unwrap_or_else(|| self.map.get_or_insert(key));
         StorageWriteGuard {
             storage: self,
             inner,
@@ -487,54 +487,52 @@ impl Storage {
             // Removals that would invert task_cache -> task lock ordering are deferred until no
             // task lock is held.
             let mut deferred_task_cache_removals: Vec<CachedTaskTypeArc> = Vec::new();
-            for offset in 0..crate::backend::dense_task_map::CHUNK_SIZE {
-                chunk.update_slot(offset, |slot| {
-                    let Some(task) = slot.as_mut() else {
-                        return;
-                    };
-                    let task_id = chunk.task_id(offset);
-                    if task_id.is_transient() {
-                        evicted.unevictable_reasons[UnevictableReason::Transient.index()] += 1;
-                        return;
+            for offset in chunk.chunk.probably_occupied_offsets() {
+                let Some(mut task) = chunk.get(offset) else {
+                    continue;
+                };
+                let task_id = *task.key();
+                if task_id.is_transient() {
+                    evicted.unevictable_reasons[UnevictableReason::Transient.index()] += 1;
+                    continue;
+                }
+                let (key_evictability, value_evictability) = task.evictability();
+                match key_evictability {
+                    KeyEvictability::Evictable => {
+                        let task_type = task.get_persistent_task_type().unwrap();
+                        match try_lock_and_remove(&self.task_cache, task_type.as_ref()) {
+                            TryLockAndRemove::Removed => evicted.key_evictions += 1,
+                            TryLockAndRemove::NotFound => {}
+                            TryLockAndRemove::WouldBlock => {
+                                deferred_task_cache_removals.push(task_type.clone());
+                            }
+                        }
                     }
-                    let (key_evictability, value_evictability) = task.evictability();
-                    match key_evictability {
-                        KeyEvictability::Evictable => {
-                            let task_type = task.get_persistent_task_type().unwrap();
-                            match try_lock_and_remove(&self.task_cache, task_type.as_ref()) {
-                                TryLockAndRemove::Removed => evicted.key_evictions += 1,
-                                TryLockAndRemove::NotFound => {}
-                                TryLockAndRemove::WouldBlock => {
-                                    deferred_task_cache_removals.push(task_type.clone());
+                    KeyEvictability::AlreadyEvicted | KeyEvictability::Unevictable => {}
+                }
+                match value_evictability {
+                    ValueEvictability::Evictable { meta, data } => {
+                        match task.drop_partial(data, meta) {
+                            DropPartialOutcome::Empty => {
+                                evicted.full += 1;
+                                task.vacate();
+                            }
+                            DropPartialOutcome::HasResidue => {
+                                if data && meta {
+                                    evicted.data_and_meta += 1;
+                                } else if data {
+                                    evicted.data_only += 1;
+                                } else {
+                                    debug_assert!(meta);
+                                    evicted.meta_only += 1;
                                 }
                             }
                         }
-                        KeyEvictability::AlreadyEvicted | KeyEvictability::Unevictable => {}
                     }
-                    match value_evictability {
-                        ValueEvictability::Evictable { meta, data } => {
-                            match task.drop_partial(data, meta) {
-                                DropPartialOutcome::Empty => {
-                                    evicted.full += 1;
-                                    *slot = None;
-                                }
-                                DropPartialOutcome::HasResidue => {
-                                    if data && meta {
-                                        evicted.data_and_meta += 1;
-                                    } else if data {
-                                        evicted.data_only += 1;
-                                    } else {
-                                        debug_assert!(meta);
-                                        evicted.meta_only += 1;
-                                    }
-                                }
-                            }
-                        }
-                        ValueEvictability::Unevictable(reason) => {
-                            evicted.unevictable_reasons[reason.index()] += 1;
-                        }
+                    ValueEvictability::Unevictable(reason) => {
+                        evicted.unevictable_reasons[reason.index()] += 1;
                     }
-                });
+                }
             }
             for task_type in deferred_task_cache_removals {
                 if self.task_cache.remove(task_type.as_ref()).is_some() {
@@ -569,7 +567,7 @@ impl Storage {
 
 /// Exclusive access to one resident task.
 ///
-/// `TaskMapGuard` uses parking_lot's default non-send guard marker. Keeping this wrapper `!Send`
+/// `TaskMapGuard` mirrors parking_lot's default non-send guard marker. Keeping this wrapper `!Send`
 /// prevents a task lock from being held across an `.await` in a sendable future.
 pub struct StorageWriteGuard<'a> {
     storage: &'a Storage,
@@ -1006,6 +1004,28 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_first_modified_during_snapshot_is_carried_forward() {
+        let storage = Storage::new(2, true);
+        let task_id = non_transient_task(1);
+        let (snapshot_guard, has_modifications) = storage.start_snapshot();
+        assert!(!has_modifications);
+
+        {
+            let mut task = storage.access_mut(task_id);
+            let _ = task.track_modification(SpecificTaskDataCategory::Data, "test");
+            assert!(task.flags.data_modified_during_snapshot());
+            assert!(!task.flags.data_modified());
+        }
+
+        drop(snapshot_guard);
+        let (_next_snapshot_guard, has_modifications) = storage.start_snapshot();
+        assert!(has_modifications);
+        let task = storage.access_mut(task_id);
+        assert!(task.flags.data_modified());
+        assert!(!task.flags.data_modified_during_snapshot());
+    }
+
     /// Regression test: a task modified before a snapshot and then modified *again* during
     /// snapshot iteration must serialize the pre-snapshot state and carry the during-snapshot
     /// modification forward to the next cycle.
@@ -1213,7 +1233,11 @@ mod tests {
         assert_eq!(items.len(), task_ids.len());
         assert_eq!(storage.map.len(), 0);
         for chunk in storage.map.chunks() {
-            assert!(chunk.chunk.slots().iter().all(|slot| slot.lock().is_none()));
+            let hinted: Vec<_> = chunk.chunk.probably_occupied_offsets().collect();
+            for offset in hinted {
+                assert!(chunk.get(offset).is_none());
+            }
+            assert!(chunk.chunk.probably_occupied_offsets().next().is_none());
         }
     }
 

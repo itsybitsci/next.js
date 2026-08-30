@@ -1,6 +1,18 @@
-use std::{hint::black_box, num::NonZeroU64, sync::Arc, thread, time::Instant};
+use std::{
+    hint::black_box,
+    num::NonZeroU64,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::Instant,
+};
 
 use criterion::{BenchmarkId, Criterion, Throughput};
+use parking_lot::{
+    MappedMutexGuard, Mutex, MutexGuard, RawMutex, lock_api::RawMutex as RawMutexTrait,
+};
 use turbo_tasks::{FxDashMap, TaskId};
 use turbo_tasks_malloc::TurboMalloc;
 
@@ -8,28 +20,178 @@ use turbo_tasks_malloc::TurboMalloc;
 #[path = "../src/backend/dense_task_map.rs"]
 mod dense_task_map;
 
-use dense_task_map::TaskMap;
+use dense_task_map::{TaskMap, TaskSlotValue};
 
 const LOOKUP_TASKS: u32 = 64 * 1024;
 const BUILD_TASKS: u32 = 8 * 1024;
+const SPARSE_TASKS: u32 = LOOKUP_TASKS / 10;
 
-#[derive(Clone, Copy)]
 struct Payload {
     niche: NonZeroU64,
-    data: [u64; 15],
+    data: [u64; 14],
+    lock: RawMutex,
+    occupied: bool,
 }
 
 impl Payload {
     fn new(id: u32) -> Self {
         Self {
             niche: NonZeroU64::new(id as u64).unwrap(),
-            data: [id as u64; 15],
+            data: [0; 14],
+            lock: <RawMutex as RawMutexTrait>::INIT,
+            occupied: false,
         }
     }
 
-    fn value(&self) -> u64 {
-        self.niche.get() ^ self.data[0]
+    fn set(&mut self, id: u32) {
+        self.niche = NonZeroU64::new(id as u64).unwrap();
+        self.data = [0; 14];
     }
+
+    fn value(&self) -> u64 {
+        self.niche.get()
+    }
+}
+
+// SAFETY: Benchmark payload follows the same stable intrusive-lock/presence contract as
+// TaskStorage. All access through TaskMap is guarded.
+unsafe impl TaskSlotValue for Payload {
+    const EMPTY: Self = Self {
+        niche: NonZeroU64::MIN,
+        data: [0; 14],
+        lock: <RawMutex as RawMutexTrait>::INIT,
+        occupied: false,
+    };
+
+    fn lock(&self) {
+        self.lock.lock();
+    }
+
+    unsafe fn unlock(&self) {
+        // SAFETY: Forwarded from TaskMap's owning guard.
+        unsafe { self.lock.unlock() };
+    }
+
+    fn is_occupied(&self) -> bool {
+        self.occupied
+    }
+
+    fn occupy(&mut self) {
+        self.occupied = true;
+    }
+
+    fn take_and_vacate(&mut self) -> Self {
+        let detached = Self {
+            niche: self.niche,
+            data: self.data,
+            lock: <RawMutex as RawMutexTrait>::INIT,
+            occupied: false,
+        };
+        self.niche = NonZeroU64::MIN;
+        self.data = [0; 14];
+        self.occupied = false;
+        detached
+    }
+
+    fn vacate_in_place(&mut self) {
+        self.niche = NonZeroU64::MIN;
+        self.data = [0; 14];
+        self.occupied = false;
+    }
+}
+
+const CHUNK_SIZE: usize = dense_task_map::CHUNK_SIZE;
+const CHUNK_SHIFT: usize = 10;
+const CHUNK_MASK: usize = CHUNK_SIZE - 1;
+
+type ExternalSlot = Mutex<Option<Payload>>;
+
+struct ExternalChunk {
+    slots: Box<[ExternalSlot; CHUNK_SIZE]>,
+}
+
+impl ExternalChunk {
+    fn new() -> Self {
+        Self {
+            slots: Box::new(std::array::from_fn(|_| Mutex::new(None))),
+        }
+    }
+}
+
+struct ExternalMap {
+    chunks: boxcar::Vec<OnceLock<Box<ExternalChunk>>>,
+    len: AtomicUsize,
+}
+
+impl ExternalMap {
+    fn new() -> Self {
+        Self {
+            chunks: boxcar::Vec::new(),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn chunk(&self, index: usize) -> Option<&ExternalChunk> {
+        self.chunks
+            .get(index >> CHUNK_SHIFT)?
+            .get()
+            .map(Box::as_ref)
+    }
+
+    fn get_or_create_chunk(&self, index: usize) -> &ExternalChunk {
+        let chunk_index = index >> CHUNK_SHIFT;
+        loop {
+            if let Some(chunk) = self.chunks.get(chunk_index) {
+                return chunk.get_or_init(|| Box::new(ExternalChunk::new()));
+            }
+            if self.chunks.count() <= chunk_index {
+                self.chunks.push(OnceLock::new());
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    fn get(&self, id: TaskId) -> Option<MappedMutexGuard<'_, Payload>> {
+        let index = *id as usize;
+        let chunk = self.chunk(index)?;
+        MutexGuard::try_map(chunk.slots[index & CHUNK_MASK].lock(), Option::as_mut).ok()
+    }
+
+    fn get_or_insert(&self, id: TaskId) -> MappedMutexGuard<'_, Payload> {
+        let index = *id as usize;
+        let chunk = self.get_or_create_chunk(index);
+        let mut slot = chunk.slots[index & CHUNK_MASK].lock();
+        if slot.is_none() {
+            *slot = Some(Payload::new(*id));
+            self.len.fetch_add(1, Ordering::Relaxed);
+        }
+        MutexGuard::map(slot, |slot| slot.as_mut().unwrap())
+    }
+
+    fn remove(&self, id: TaskId) -> Option<Payload> {
+        let index = *id as usize;
+        let value = self.chunk(index)?.slots[index & CHUNK_MASK].lock().take();
+        if value.is_some() {
+            self.len.fetch_sub(1, Ordering::Relaxed);
+        }
+        value
+    }
+
+    fn chunks(&self) -> impl Iterator<Item = &ExternalChunk> {
+        self.chunks
+            .iter()
+            .filter_map(|(_, chunk)| chunk.get().map(Box::as_ref))
+    }
+}
+
+fn external_map(count: u32, stride: u32) -> ExternalMap {
+    let map = ExternalMap::new();
+    for i in 1..=count {
+        let raw = i * stride;
+        map.get_or_insert(task_id(raw)).set(raw);
+    }
+    map
 }
 
 fn task_id(raw: u32) -> TaskId {
@@ -46,10 +208,10 @@ fn dash_map(count: u32, stride: u32) -> FxDashMap<TaskId, Box<Payload>> {
 }
 
 fn dense_map(count: u32, stride: u32) -> TaskMap<Payload> {
-    let map = TaskMap::new(true);
+    let map = TaskMap::<Payload>::new(true);
     for i in 1..=count {
         let raw = i * stride;
-        map.get_or_insert_with(task_id(raw), || Payload::new(raw));
+        map.get_or_insert(task_id(raw)).set(raw);
     }
     map
 }
@@ -69,6 +231,17 @@ fn report_memory(count: u32, stride: u32, shape: &str) {
     TurboMalloc::collect(true);
     let before = TurboMalloc::memory_usage();
     let before_allocations = TurboMalloc::allocation_counters().allocation_count;
+    let external = external_map(count, stride);
+    let external_bytes = TurboMalloc::memory_usage().saturating_sub(before);
+    let external_allocations = TurboMalloc::allocation_counters()
+        .allocation_count
+        .saturating_sub(before_allocations);
+    black_box(&external);
+    drop(external);
+
+    TurboMalloc::collect(true);
+    let before = TurboMalloc::memory_usage();
+    let before_allocations = TurboMalloc::allocation_counters().allocation_count;
     let dense = dense_map(count, stride);
     let dense_bytes = TurboMalloc::memory_usage().saturating_sub(before);
     let dense_allocations = TurboMalloc::allocation_counters()
@@ -80,10 +253,12 @@ fn report_memory(count: u32, stride: u32, shape: &str) {
     println!(
         "resident_storage_memory shape={shape} residents={count} high_water={} \
          dash_bytes={dash_bytes} dash_bytes_per_task={:.2} dash_allocations={dash_allocations} \
-         dense_bytes={dense_bytes} dense_bytes_per_task={:.2} \
-         dense_allocations={dense_allocations}",
+         external_bytes={external_bytes} external_bytes_per_task={:.2} \
+         external_allocations={external_allocations} dense_bytes={dense_bytes} \
+         dense_bytes_per_task={:.2} dense_allocations={dense_allocations}",
         count * stride,
         dash_bytes as f64 / count as f64,
+        external_bytes as f64 / count as f64,
         dense_bytes as f64 / count as f64,
     );
 }
@@ -93,6 +268,7 @@ pub fn resident_storage(c: &mut Criterion) {
     report_memory(10_000, 10, "warm_sparse");
 
     let dash = dash_map(LOOKUP_TASKS, 1);
+    let external = external_map(LOOKUP_TASKS, 1);
     let dense = dense_map(LOOKUP_TASKS, 1);
 
     let mut lookup = c.benchmark_group("resident_storage_lookup");
@@ -103,6 +279,13 @@ pub fn resident_storage(c: &mut Criterion) {
             next = next % LOOKUP_TASKS + 1;
             let item = dash.get(&task_id(next)).unwrap();
             black_box(item.value().as_ref().value())
+        })
+    });
+    let mut next = 1_u32;
+    lookup.bench_function("external_mutex", |b| {
+        b.iter(|| {
+            next = next % LOOKUP_TASKS + 1;
+            black_box(external.get(task_id(next)).unwrap().value())
         })
     });
     let mut next = 1_u32;
@@ -123,13 +306,18 @@ pub fn resident_storage(c: &mut Criterion) {
         })
     });
     let mut next = 1_u32;
+    lookup.bench_function("external_mutex_mut", |b| {
+        b.iter(|| {
+            next = next % LOOKUP_TASKS + 1;
+            black_box(external.get_or_insert(task_id(next)).value())
+        })
+    });
+    let mut next = 1_u32;
     lookup.bench_function("dense_mut", |b| {
         b.iter(|| {
             next = next % LOOKUP_TASKS + 1;
             let id = task_id(next);
-            let item = dense
-                .get(id)
-                .unwrap_or_else(|| dense.get_or_insert_with(id, || Payload::new(next)));
+            let item = dense.get(id).unwrap_or_else(|| dense.get_or_insert(id));
             black_box(item.value())
         })
     });
@@ -144,6 +332,11 @@ pub fn resident_storage(c: &mut Criterion) {
         |b, &count| b.iter(|| black_box(dash_map(count, 1))),
     );
     build.bench_with_input(
+        BenchmarkId::new("external_mutex", BUILD_TASKS),
+        &BUILD_TASKS,
+        |b, &count| b.iter(|| black_box(external_map(count, 1))),
+    );
+    build.bench_with_input(
         BenchmarkId::new("dense", BUILD_TASKS),
         &BUILD_TASKS,
         |b, &count| b.iter(|| black_box(dense_map(count, 1))),
@@ -151,6 +344,7 @@ pub fn resident_storage(c: &mut Criterion) {
     build.finish();
 
     let dash = dash_map(LOOKUP_TASKS, 1);
+    let external = external_map(LOOKUP_TASKS, 1);
     let dense = dense_map(LOOKUP_TASKS, 1);
     let mut reuse = c.benchmark_group("resident_storage_remove_reuse");
     let mut next = 1_u32;
@@ -163,15 +357,49 @@ pub fn resident_storage(c: &mut Criterion) {
         })
     });
     let mut next = 1_u32;
+    reuse.bench_function("external_mutex", |b| {
+        b.iter(|| {
+            next = next % LOOKUP_TASKS + 1;
+            let id = task_id(next);
+            black_box(external.remove(id));
+            external.get_or_insert(id).set(next);
+        })
+    });
+    let mut next = 1_u32;
     reuse.bench_function("dense", |b| {
         b.iter(|| {
             next = next % LOOKUP_TASKS + 1;
             let id = task_id(next);
             black_box(dense.remove(id));
-            black_box(dense.get_or_insert_with(id, || Payload::new(next)));
+            let mut item = dense.get_or_insert(id);
+            item.set(next);
+            black_box(item.value());
         })
     });
     reuse.finish();
+
+    let external = external_map(LOOKUP_TASKS, 1);
+    let dense = dense_map(LOOKUP_TASKS, 1);
+    let mut discard_reuse = c.benchmark_group("resident_storage_discard_reuse");
+    let mut next = 1_u32;
+    discard_reuse.bench_function("external_mutex", |b| {
+        b.iter(|| {
+            next = next % LOOKUP_TASKS + 1;
+            let id = task_id(next);
+            black_box(external.remove(id));
+            external.get_or_insert(id).set(next);
+        })
+    });
+    let mut next = 1_u32;
+    discard_reuse.bench_function("dense", |b| {
+        b.iter(|| {
+            next = next % LOOKUP_TASKS + 1;
+            let id = task_id(next);
+            black_box(dense.remove_discard(id));
+            dense.get_or_insert(id).set(next);
+        })
+    });
+    discard_reuse.finish();
 
     let collision_probe = dash_map(0, 1);
     let first = task_id(1);
@@ -184,10 +412,12 @@ pub fn resident_storage(c: &mut Criterion) {
         .take(4)
         .collect();
     let dash = Arc::new(FxDashMap::default());
-    let dense = Arc::new(TaskMap::new(true));
+    let external = Arc::new(ExternalMap::new());
+    let dense = Arc::new(TaskMap::<Payload>::new(true));
     for &id in &colliding_ids {
         dash.insert(id, Box::new(Payload::new(*id)));
-        dense.get_or_insert_with(id, || Payload::new(*id));
+        external.get_or_insert(id).set(*id);
+        dense.get_or_insert(id).set(*id);
     }
     let mut contention = c.benchmark_group("resident_storage_independent_task_contention");
     contention.bench_function("dash_map_same_shard", |b| {
@@ -200,6 +430,23 @@ pub fn resident_storage(c: &mut Criterion) {
                     scope.spawn(move || {
                         for _ in 0..per_thread {
                             dash.get_mut(&id).unwrap().data[0] ^= 1;
+                        }
+                    });
+                }
+            });
+            start.elapsed()
+        })
+    });
+    contention.bench_function("external_mutex_independent_locks", |b| {
+        b.iter_custom(|iterations| {
+            let per_thread = iterations.div_ceil(colliding_ids.len() as u64);
+            let start = Instant::now();
+            thread::scope(|scope| {
+                for &id in &colliding_ids {
+                    let external = external.clone();
+                    scope.spawn(move || {
+                        for _ in 0..per_thread {
+                            external.get(id).unwrap().data[0] ^= 1;
                         }
                     });
                 }
@@ -227,6 +474,7 @@ pub fn resident_storage(c: &mut Criterion) {
     contention.finish();
 
     let dash = dash_map(LOOKUP_TASKS, 1);
+    let external = external_map(LOOKUP_TASKS, 1);
     let dense = dense_map(LOOKUP_TASKS, 1);
     let mut iteration = c.benchmark_group("resident_storage_iteration");
     iteration.throughput(Throughput::Elements(LOOKUP_TASKS as u64));
@@ -238,12 +486,25 @@ pub fn resident_storage(c: &mut Criterion) {
             black_box(sum)
         })
     });
+    iteration.bench_function("external_mutex", |b| {
+        b.iter(|| {
+            let mut sum = 0_u64;
+            for chunk in external.chunks() {
+                for slot in &*chunk.slots {
+                    if let Some(value) = slot.lock().as_ref() {
+                        sum ^= value.value();
+                    }
+                }
+            }
+            black_box(sum)
+        })
+    });
     iteration.bench_function("dense", |b| {
         b.iter(|| {
             let mut sum = 0_u64;
             for chunk in dense.chunks() {
-                for slot in chunk.chunk.slots() {
-                    if let Some(value) = slot.lock().as_ref() {
+                for offset in chunk.chunk.probably_occupied_offsets() {
+                    if let Some(value) = chunk.get(offset) {
                         sum ^= value.value();
                     }
                 }
@@ -285,15 +546,50 @@ pub fn resident_storage(c: &mut Criterion) {
             runtime.block_on(async {
                 let sums: Vec<u64> =
                     turbo_tasks::parallel::map_collect(&regions, |&(chunk, start)| {
-                        chunk.chunk.slots()[start..start + 64]
-                            .iter()
-                            .fold(0_u64, |sum, slot| {
-                                sum ^ slot.lock().as_ref().map_or(0, Payload::value)
-                            })
+                        (start..start + 64).fold(0_u64, |sum, offset| {
+                            if !chunk.chunk.is_probably_occupied(offset) {
+                                return sum;
+                            }
+                            sum ^ chunk.get(offset).map_or(0, |value| value.value())
+                        })
                     });
                 black_box(sums.into_iter().fold(0_u64, |sum, value| sum ^ value))
             })
         })
     });
     iteration.finish();
+
+    let dash = dash_map(SPARSE_TASKS, 10);
+    let dense = dense_map(SPARSE_TASKS, 10);
+    // The first scan cleans the conservatively-set bitmap bits for never-occupied slots. This
+    // models incremental scans after the first eviction/restoration pass established sparsity.
+    for chunk in dense.chunks() {
+        for offset in chunk.chunk.probably_occupied_offsets() {
+            drop(chunk.get(offset));
+        }
+    }
+    let mut sparse_iteration = c.benchmark_group("resident_storage_sparse_iteration");
+    sparse_iteration.throughput(Throughput::Elements(SPARSE_TASKS as u64));
+    sparse_iteration.bench_function("dash_map", |b| {
+        b.iter(|| {
+            let sum = dash
+                .iter()
+                .fold(0_u64, |sum, item| sum ^ item.value().value());
+            black_box(sum)
+        })
+    });
+    sparse_iteration.bench_function("dense_bitmap", |b| {
+        b.iter(|| {
+            let mut sum = 0_u64;
+            for chunk in dense.chunks() {
+                for offset in chunk.chunk.probably_occupied_offsets() {
+                    if let Some(value) = chunk.get(offset) {
+                        sum ^= value.value();
+                    }
+                }
+            }
+            black_box(sum)
+        })
+    });
+    sparse_iteration.finish();
 }

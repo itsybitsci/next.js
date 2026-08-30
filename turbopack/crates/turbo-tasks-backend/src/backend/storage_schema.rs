@@ -1009,10 +1009,14 @@ impl<K: IsTransient + Hash + Eq, V: IsTransient, const I: usize> DropPartial for
 mod tests {
     use std::mem::size_of;
 
+    use parking_lot::Mutex;
     use turbo_tasks::{CellId, TaskId};
 
     use super::*;
-    use crate::data::{AggregationNumber, CellRef, Dirtyness, OutputValue};
+    use crate::{
+        backend::dense_task_map::{CHUNK_SIZE, TaskChunk},
+        data::{AggregationNumber, CellRef, Dirtyness, OutputValue},
+    };
 
     #[test]
     fn test_accessors() {
@@ -1751,6 +1755,31 @@ mod tests {
             size_of::<TaskStorage>(),
             128,
             "TaskStorage size changed! Update this test."
+        );
+        assert_eq!(
+            size_of::<Option<TaskStorage>>(),
+            128,
+            "TaskStorage's niche should make its Option free"
+        );
+        assert_eq!(
+            size_of::<Mutex<Option<Box<TaskStorage>>>>(),
+            16,
+            "boxed task slot size changed"
+        );
+        assert_eq!(
+            size_of::<Mutex<Option<TaskStorage>>>(),
+            136,
+            "inline task slot size changed"
+        );
+        assert_eq!(
+            size_of::<TaskChunk<TaskStorage>>(),
+            16,
+            "chunk header size changed"
+        );
+        assert_eq!(
+            size_of::<[Mutex<Option<TaskStorage>>; CHUNK_SIZE]>(),
+            136 * CHUNK_SIZE,
+            "chunk slot allocation size changed"
         );
         // `LazyField` is 40 B = 32 B largest payload + 8 B discriminant.
         assert_eq!(

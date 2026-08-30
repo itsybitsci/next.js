@@ -1,5 +1,6 @@
 mod cell_data;
 mod counter_map;
+mod dense_task_map;
 mod eviction;
 mod operation;
 mod snapshot_coordinator;
@@ -82,7 +83,7 @@ use crate::{
     kv_backing_storage::TurboBackingStorage,
     utils::{
         dash_map_entry::{get_in_shard, get_shard, with_entry_in_shard},
-        shard_amount::compute_shard_amount,
+        shard_amount::compute_snapshot_shard_amount,
         stopwatch::Stopwatch,
     },
 };
@@ -136,8 +137,8 @@ pub struct BackendOptions {
     /// Enables the backing storage.
     pub storage_mode: Option<StorageMode>,
 
-    /// Number of tokio worker threads. It will be used to compute the shard amount of parallel
-    /// datastructures. If `None`, it will use the available parallelism.
+    /// Number of tokio worker threads. It is used to size parallel work and the small
+    /// during-snapshot map. If `None`, available parallelism is used.
     pub num_workers: Option<usize>,
 
     /// Avoid big preallocations for faster startup. Should only be used for testing purposes.
@@ -240,7 +241,8 @@ impl TurboTasksBackend {
     }
 
     pub fn new(mut options: BackendOptions, backing_storage: TurboBackingStorage) -> Self {
-        let shard_amount = compute_shard_amount(options.num_workers, options.small_preallocation);
+        let snapshot_shard_amount =
+            compute_snapshot_shard_amount(options.num_workers, options.small_preallocation);
         if !options.dependency_tracking {
             options.active_tracking = false;
         }
@@ -259,7 +261,7 @@ impl TurboTasksBackend {
                 TaskId::try_from(TRANSIENT_TASK_BIT).unwrap(),
                 TaskId::MAX,
             ),
-            storage: Storage::new(shard_amount, small_preallocation),
+            storage: Storage::new(snapshot_shard_amount, small_preallocation),
             snapshot_coord: SnapshotCoordinator::new(),
             snapshot_in_progress: Mutex::new(()),
             stopping: AtomicBool::new(false),

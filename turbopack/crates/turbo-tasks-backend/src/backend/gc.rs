@@ -197,7 +197,8 @@ impl TurboTasksBackend {
         let aged_out = self.gc_roots_refresh_and_age_out(&mut roots, now, first_pass_of_session);
 
         let aged_out_count = aged_out.len();
-        // TODO(perf): recycle the task ids of collected tasks.
+        // The ids of the tasks collected below are recycled once eviction has erased them and
+        // their deferral window has elapsed — see [`crate::backend::id_reuse`].
         let budget = GcBudget {
             coord: &self.snapshot_coord,
             started: Instant::now(),

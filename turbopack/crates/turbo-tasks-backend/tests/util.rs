@@ -113,3 +113,31 @@ pub fn create_tt_with_workers(
 pub fn create_tt(name: &str) -> (Arc<TurboTasks<TurboTasksBackend>>, tempfile::TempDir) {
     create_tt_with_workers(name, 2)
 }
+
+/// A fresh persistent backend built from caller-supplied [`BackendOptions`], for tests that need
+/// to pin an option the helpers above don't expose. The caller owns every option, including `gc`
+/// — the other helpers' GC-on default does not apply.
+pub fn create_tt_with_options(
+    name: &str,
+    options: BackendOptions,
+) -> (Arc<TurboTasks<TurboTasksBackend>>, tempfile::TempDir) {
+    let dir = create_persistence_dir(name);
+    let tt = TurboTasks::new(TurboTasksBackend::new(
+        options,
+        turbo_tasks_backend::turbo_backing_storage(
+            dir.path(),
+            &GitVersionInfo {
+                describe: "test-unversioned",
+                dirty: false,
+            },
+            BackingStorageOptions {
+                is_short_session: true,
+                skip_compaction: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0,
+    ));
+    (tt, dir)
+}

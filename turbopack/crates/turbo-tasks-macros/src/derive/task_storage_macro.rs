@@ -1439,17 +1439,6 @@ fn generate_typed_storage_struct(grouped_fields: &GroupedFields) -> TokenStream 
                 Self::default()
             }
 
-            #[doc = "Returns whether this slot is authoritatively occupied."]
-            pub(crate) fn is_occupied(&self) -> bool {
-                self.occupied
-            }
-
-            #[doc = "Marks a vacant slot occupied. The caller must hold the intrusive lock."]
-            pub(crate) fn occupy(&mut self) {
-                debug_assert!(!self.occupied);
-                self.occupied = true;
-            }
-
             #[doc = "Moves payload into a fresh unlocked value and leaves this locked slot vacant."]
             #[doc = "The caller must hold this task's intrusive lock."]
             pub(crate) fn take_and_vacate(&mut self) -> Self {

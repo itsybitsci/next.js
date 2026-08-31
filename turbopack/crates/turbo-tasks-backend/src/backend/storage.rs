@@ -272,9 +272,8 @@ impl Storage {
         drain_entries: bool,
     ) -> Vec<SnapshotShard<'l, P>> {
         let guard = Arc::new(guard);
-        let chunks = self.map.chunks();
 
-        parallel::map_collect::<_, _, Vec<_>>(&chunks, |&chunk| {
+        let shards: Vec<Option<SnapshotShard<'l, P>>> = self.map.parallel_collect(|chunk| {
             // Once snapshot mode is active, new writes use the during-snapshot flags and do not
             // increment this counter. Each chunk can therefore be claimed independently.
             let modified_count = chunk.chunk.modified_count.swap(0, Ordering::Relaxed);
@@ -284,10 +283,7 @@ impl Storage {
 
             let work = if drain_entries {
                 let mut entries = Vec::with_capacity(modified_count as usize);
-                for offset in chunk.chunk.probably_occupied_offsets() {
-                    let Some(task) = chunk.get(offset) else {
-                        continue;
-                    };
+                chunk.for_each_mut(|task| {
                     if task.flags.any_modified() {
                         let task_id = *task.key();
                         debug_assert!(
@@ -300,17 +296,14 @@ impl Storage {
                         // only modified tasks need a detached value for persistence.
                         task.vacate();
                     }
-                }
+                });
                 if entries.is_empty() {
                     return None;
                 }
                 ShardWork::Drain(entries.into_iter())
             } else {
                 let mut modified = Vec::with_capacity(modified_count as usize);
-                for offset in chunk.chunk.probably_occupied_offsets() {
-                    let Some(task) = chunk.get(offset) else {
-                        continue;
-                    };
+                chunk.for_each_mut(|task| {
                     if task.flags.any_modified() {
                         let task_id = *task.key();
                         debug_assert!(
@@ -319,7 +312,7 @@ impl Storage {
                         );
                         modified.push(task_id);
                     }
-                }
+                });
                 debug_assert!(!modified.is_empty());
                 ShardWork::Keep(modified)
             };
@@ -330,10 +323,8 @@ impl Storage {
                 process,
                 _guard: guard.clone(),
             })
-        })
-        .into_iter()
-        .flatten()
-        .collect()
+        });
+        shards.into_iter().flatten().collect()
     }
 
     /// Enter snapshot mode and return a guard that will call `end_snapshot` on drop.
@@ -432,17 +423,14 @@ impl Storage {
         key2: TaskId,
     ) -> (StorageWriteGuard<'_>, StorageWriteGuard<'_>) {
         assert_ne!(key1, key2, "cannot mutably access the same task twice");
-        let (lower, upper, reversed) = if key1 < key2 {
-            (key1, key2, false)
+        if key1 < key2 {
+            let value1 = self.access_mut(key1);
+            let value2 = self.access_mut(key2);
+            (value1, value2)
         } else {
-            (key2, key1, true)
-        };
-        let lower = self.access_mut(lower);
-        let upper = self.access_mut(upper);
-        if reversed {
-            (upper, lower)
-        } else {
-            (lower, upper)
+            let value2 = self.access_mut(key2);
+            let value1 = self.access_mut(key1);
+            (value1, value2)
         }
     }
 
@@ -481,20 +469,16 @@ impl Storage {
             "evict_after_snapshot must not be called during snapshot mode"
         );
 
-        let chunks = self.map.chunks();
-        let counts: Vec<EvictionCounts> = parallel::map_collect(&chunks, |&chunk| {
+        let counts: Vec<EvictionCounts> = self.map.parallel_collect(|chunk| {
             let mut evicted = EvictionCounts::default();
             // Removals that would invert task_cache -> task lock ordering are deferred until no
             // task lock is held.
             let mut deferred_task_cache_removals: Vec<CachedTaskTypeArc> = Vec::new();
-            for offset in chunk.chunk.probably_occupied_offsets() {
-                let Some(mut task) = chunk.get(offset) else {
-                    continue;
-                };
+            chunk.for_each_mut(|mut task| {
                 let task_id = *task.key();
                 if task_id.is_transient() {
                     evicted.unevictable_reasons[UnevictableReason::Transient.index()] += 1;
-                    continue;
+                    return;
                 }
                 let (key_evictability, value_evictability) = task.evictability();
                 match key_evictability {
@@ -533,7 +517,7 @@ impl Storage {
                         evicted.unevictable_reasons[reason.index()] += 1;
                     }
                 }
-            }
+            });
             for task_type in deferred_task_cache_removals {
                 if self.task_cache.remove(task_type.as_ref()).is_some() {
                     evicted.key_evictions += 1;
@@ -566,9 +550,6 @@ impl Storage {
 }
 
 /// Exclusive access to one resident task.
-///
-/// `TaskMapGuard` mirrors parking_lot's default non-send guard marker. Keeping this wrapper `!Send`
-/// prevents a task lock from being held across an `.await` in a sendable future.
 pub struct StorageWriteGuard<'a> {
     storage: &'a Storage,
     inner: TaskMapGuard<'a, TaskStorage>,

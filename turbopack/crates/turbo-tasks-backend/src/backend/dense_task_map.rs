@@ -7,7 +7,6 @@
 
 use std::{
     cell::UnsafeCell,
-    marker::PhantomData,
     ops::{Deref, DerefMut},
     sync::{
         OnceLock,
@@ -25,6 +24,10 @@ pub(crate) const BITMAP_WORDS: usize = CHUNK_SIZE / BITMAP_WORD_BITS;
 
 /// Value stored in an always-initialized intrusive task slot.
 ///
+/// This small abstraction lets the container's concurrency invariants be tested with a minimal
+/// value and lets the benchmark compare the exact container using a representative 128-byte value.
+/// Production has a single implementation for `TaskStorage`.
+///
 /// # Safety
 ///
 /// Implementations must keep the lock at a stable address, initialize it in `EMPTY`, require the
@@ -32,12 +35,11 @@ pub(crate) const BITMAP_WORDS: usize = CHUNK_SIZE / BITMAP_WORD_BITS;
 pub(crate) unsafe trait TaskSlotValue: Sized {
     const EMPTY: Self;
 
-    fn lock(&self);
+    type Guard<'a>: 'a
+    where
+        Self: 'a;
 
-    /// # Safety
-    ///
-    /// The current thread must own this value's lock and perform no protected access afterward.
-    unsafe fn unlock(&self);
+    fn lock(&self) -> Self::Guard<'_>;
 
     fn is_occupied(&self) -> bool;
     fn occupy(&mut self);
@@ -56,12 +58,12 @@ impl<T: TaskSlotValue> TaskSlot<T> {
 
     fn lock(&self) -> TaskSlotGuard<'_, T> {
         // SAFETY: The value is initialized by `empty` and never moved after its chunk is published.
-        // Calling `lock` only reads/mutates the embedded raw mutex, whose implementation provides
+        // Calling `lock` only accesses the embedded mutex, whose implementation provides
         // the synchronization for all subsequent accesses through the returned guard.
-        unsafe { &*self.0.get() }.lock();
+        let lock = unsafe { &*self.0.get() }.lock();
         TaskSlotGuard {
             slot: self,
-            _not_send: PhantomData,
+            _lock: lock,
         }
     }
 }
@@ -72,9 +74,7 @@ unsafe impl<T: TaskSlotValue + Send> Sync for TaskSlot<T> {}
 
 struct TaskSlotGuard<'a, T: TaskSlotValue> {
     slot: &'a TaskSlot<T>,
-    // parking_lot guards are !Send by default. Preserve that property for the custom raw guard so
-    // a task lock cannot be held across `.await` in a sendable future.
-    _not_send: PhantomData<*const ()>,
+    _lock: T::Guard<'a>,
 }
 
 impl<T: TaskSlotValue> Deref for TaskSlotGuard<'_, T> {
@@ -90,13 +90,6 @@ impl<T: TaskSlotValue> DerefMut for TaskSlotGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: This guard exclusively owns the slot's intrusive lock.
         unsafe { &mut *self.slot.0.get() }
-    }
-}
-
-impl<T: TaskSlotValue> Drop for TaskSlotGuard<'_, T> {
-    fn drop(&mut self) {
-        // SAFETY: The guard owns the lock and performs no protected access after this call.
-        unsafe { (&*self.slot.0.get()).unlock() };
     }
 }
 
@@ -330,6 +323,18 @@ impl<T: TaskSlotValue> TaskMap<T> {
         self.transient.clear();
     }
 
+    pub(crate) fn parallel_collect<R, C>(
+        &self,
+        f: impl Fn(TaskChunkRef<'_, T>) -> R + Send + Sync,
+    ) -> C
+    where
+        T: Send,
+        R: Send + Sync,
+        C: FromIterator<R>,
+    {
+        parallel::map_collect_owned(self.chunks(), f)
+    }
+
     pub(crate) fn chunks(&self) -> Vec<TaskChunkRef<'_, T>> {
         self.persistent
             .chunks()
@@ -365,6 +370,14 @@ impl<T: TaskSlotValue> Clone for TaskChunkRef<'_, T> {
 }
 
 impl<T: TaskSlotValue> TaskChunkRef<'_, T> {
+    pub(crate) fn for_each_mut(&self, mut f: impl FnMut(TaskMapGuard<'_, T>)) {
+        for offset in self.chunk.probably_occupied_offsets() {
+            if let Some(task) = self.get(offset) {
+                f(task);
+            }
+        }
+    }
+
     pub(crate) fn get(&self, offset: usize) -> Option<TaskMapGuard<'_, T>> {
         if !self.chunk.is_probably_occupied(offset) {
             return None;
@@ -458,13 +471,13 @@ mod tests {
         thread,
     };
 
-    use parking_lot::{RawMutex, lock_api::RawMutex as RawMutexTrait};
+    use parking_lot::{Mutex, MutexGuard};
     use turbo_tasks::TRANSIENT_TASK_BIT;
 
     use super::*;
 
     struct TestValue {
-        lock: RawMutex,
+        lock: Mutex<()>,
         occupied: bool,
         value: usize,
         dropped: Option<Arc<AtomicUsize>>,
@@ -488,19 +501,16 @@ mod tests {
     // payload/presence access in TaskMap goes through its guard.
     unsafe impl TaskSlotValue for TestValue {
         const EMPTY: Self = Self {
-            lock: <RawMutex as RawMutexTrait>::INIT,
+            lock: Mutex::new(()),
             occupied: false,
             value: 0,
             dropped: None,
         };
 
-        fn lock(&self) {
-            self.lock.lock();
-        }
+        type Guard<'a> = MutexGuard<'a, ()>;
 
-        unsafe fn unlock(&self) {
-            // SAFETY: Forwarded from the guard that owns this lock.
-            unsafe { self.lock.unlock() };
+        fn lock(&self) -> Self::Guard<'_> {
+            self.lock.lock()
         }
 
         fn is_occupied(&self) -> bool {
@@ -519,7 +529,7 @@ mod tests {
             self.value = 0;
             self.occupied = false;
             Self {
-                lock: <RawMutex as RawMutexTrait>::INIT,
+                lock: Mutex::new(()),
                 occupied: false,
                 value,
                 dropped,
@@ -662,21 +672,22 @@ mod tests {
         assert!(!chunk.chunk.is_probably_occupied(1));
     }
 
-    #[test]
-    fn chunks_visit_dense_and_sparse_entries_once() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parallel_collect_visits_dense_and_sparse_entries_once() {
         let map = TaskMap::<TestValue>::new(true);
         let ids = [1, 2, CHUNK_SIZE as u32 + 3, (CHUNK_SIZE * 4) as u32 + 5];
         for raw in ids {
             map.get_or_insert(task_id(raw)).set(raw as usize);
         }
-        let mut seen = Vec::new();
-        for chunk in map.chunks() {
-            for offset in chunk.chunk.probably_occupied_offsets() {
-                if chunk.get(offset).is_some() {
-                    seen.push(*chunk.task_id(offset));
-                }
-            }
-        }
+        let groups: Vec<Vec<u32>> = map.parallel_collect(|chunk| {
+            let mut seen = Vec::new();
+            chunk.for_each_mut(|mut task| {
+                task.value ^= 0;
+                seen.push(**task.key());
+            });
+            seen
+        });
+        let mut seen: Vec<_> = groups.into_iter().flatten().collect();
         seen.sort_unstable();
         assert_eq!(seen, ids);
     }

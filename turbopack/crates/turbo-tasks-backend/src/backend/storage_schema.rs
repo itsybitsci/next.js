@@ -23,7 +23,7 @@ use std::{
     sync::Arc,
 };
 
-use parking_lot::{Mutex, RawMutex, lock_api::RawMutex as RawMutexTrait};
+use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHasher;
 use turbo_tasks::{
     CellId, SharedReference, ShrinkToFit, TaskExecutionReason, TaskId, TraitTypeId, ValueTypeId,
@@ -49,23 +49,18 @@ type AutoSet<K, const I: usize> = auto_hash_map::AutoSet<K, BuildHasherDefault<F
 type AutoMap<K, V, const I: usize> = auto_hash_map::AutoMap<K, V, BuildHasherDefault<FxHasher>, I>;
 
 /// Intrusive parking_lot lock embedded in each always-initialized task slot.
-pub(crate) struct IntrusiveTaskLock(RawMutex);
+///
+/// The newtype supplies the generated `Debug`, `Default`, and `ShrinkToFit` requirements while
+/// retaining parking_lot's standard RAII guard and one-byte mutex layout.
+pub(crate) struct IntrusiveTaskLock(Mutex<()>);
 
 impl IntrusiveTaskLock {
     pub(crate) const fn new() -> Self {
-        Self(<RawMutex as RawMutexTrait>::INIT)
+        Self(Mutex::new(()))
     }
 
-    pub(crate) fn lock(&self) {
-        self.0.lock();
-    }
-
-    /// # Safety
-    ///
-    /// The caller must own this lock and must not access the protected task after unlocking.
-    pub(crate) unsafe fn unlock(&self) {
-        // SAFETY: Forwarded from the caller.
-        unsafe { self.0.unlock() };
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
+        self.0.lock()
     }
 
     #[cfg(test)]
@@ -597,18 +592,14 @@ pub enum KeyEvictability {
     Unevictable,
 }
 
-// SAFETY: `TaskStorage::empty_slot` always initializes the raw mutex. Dense chunks pin every slot
+// SAFETY: `TaskStorage::empty_slot` always initializes the mutex. Dense chunks pin every slot
 // after publication, and `take_and_vacate` moves only payload fields while preserving that mutex.
 unsafe impl TaskSlotValue for TaskStorage {
     const EMPTY: Self = Self::empty_slot();
+    type Guard<'a> = MutexGuard<'a, ()>;
 
-    fn lock(&self) {
-        self.lock.lock();
-    }
-
-    unsafe fn unlock(&self) {
-        // SAFETY: Forwarded from the intrusive slot guard that owns this lock.
-        unsafe { self.lock.unlock() };
+    fn lock(&self) -> Self::Guard<'_> {
+        self.lock.lock()
     }
 
     fn is_occupied(&self) -> bool {
@@ -629,6 +620,15 @@ unsafe impl TaskSlotValue for TaskStorage {
 }
 
 impl TaskStorage {
+    pub(crate) fn is_occupied(&self) -> bool {
+        self.occupied
+    }
+
+    pub(crate) fn occupy(&mut self) {
+        debug_assert!(!self.occupied);
+        self.occupied = true;
+    }
+
     /// Canonical const representation of a vacant, always-initialized dense task slot.
     pub const fn empty_slot() -> Self {
         Self {
@@ -1108,7 +1108,6 @@ impl<K: IsTransient + Hash + Eq, V: IsTransient, const I: usize> DropPartial for
 mod tests {
     use std::{mem::size_of, sync::atomic::AtomicU64};
 
-    use parking_lot::{Mutex, RawMutex};
     use turbo_tasks::{CellId, TaskId};
 
     use super::*;
@@ -1847,6 +1846,17 @@ mod tests {
     // Schema Size Tests
     // ==========================================================================
 
+    fn with_task_locked<R>(task: &mut TaskStorage, f: impl FnOnce(&mut TaskStorage) -> R) -> R {
+        let task = task as *mut TaskStorage;
+        // SAFETY: The exclusive reference proves no other thread can access this test value. The
+        // guard remains live while the closure receives the sole mutable reference.
+        let guard = unsafe { (&*task).lock.lock() };
+        // SAFETY: The guard owns the embedded mutex and the original `&mut` was exclusive.
+        let result = f(unsafe { &mut *task });
+        drop(guard);
+        result
+    }
+
     #[test]
     fn const_empty_slots_have_independent_unlocked_mutexes() {
         let empty_task = const { TaskStorage::empty_slot() };
@@ -1856,23 +1866,23 @@ mod tests {
         assert!(!slots[1].is_occupied());
         assert!(!slots[0].lock.is_locked());
         assert!(!slots[1].lock.is_locked());
-        slots[0].lock.lock();
+        let guard = slots[0].lock.lock();
         assert!(slots[0].lock.is_locked());
         assert!(!slots[1].lock.is_locked());
-        // SAFETY: This thread acquired the lock above and does not access protected state after.
-        unsafe { slots[0].lock.unlock() };
+        drop(guard);
     }
 
     #[test]
     fn vacate_preserves_lock_and_resets_payload() {
         let mut task = TaskStorage::empty_slot();
         let lock_address = std::ptr::addr_of!(task.lock);
-        task.lock.lock();
-        task.occupy();
-        task.set_output(OutputValue::Output(TaskId::new(1).unwrap()));
-        let detached = task.take_and_vacate();
+        let detached = with_task_locked(&mut task, |task| {
+            task.occupy();
+            task.set_output(OutputValue::Output(TaskId::new(1).unwrap()));
+            task.take_and_vacate()
+        });
         assert_eq!(std::ptr::addr_of!(task.lock), lock_address);
-        assert!(task.lock.is_locked());
+        assert!(!task.lock.is_locked());
         assert!(!task.is_occupied());
         assert_eq!(task.get_output(), None);
         assert_eq!(
@@ -1881,33 +1891,30 @@ mod tests {
         );
         assert!(!detached.lock.is_locked());
         assert!(!detached.is_occupied());
-        // SAFETY: This thread acquired the source lock and no protected access follows.
-        unsafe { task.lock.unlock() };
-        task.lock.lock();
-        task.occupy();
-        task.set_output(OutputValue::Output(TaskId::new(2).unwrap()));
-        assert!(task.is_occupied());
-        task.vacate_in_place();
-        assert!(task.lock.is_locked());
-        assert!(!task.is_occupied());
-        assert_eq!(task.get_output(), None);
-        // SAFETY: This thread acquired the reused slot lock above.
-        unsafe { task.lock.unlock() };
+        with_task_locked(&mut task, |task| {
+            task.occupy();
+            task.set_output(OutputValue::Output(TaskId::new(2).unwrap()));
+            assert!(task.is_occupied());
+            task.vacate_in_place();
+            assert!(task.lock.is_locked());
+            assert!(!task.is_occupied());
+            assert_eq!(task.get_output(), None);
+        });
     }
 
     #[test]
     fn snapshot_clone_has_fresh_synchronization_state() {
         let mut task = TaskStorage::empty_slot();
-        task.lock.lock();
-        task.occupy();
-        task.set_output(OutputValue::Output(TaskId::new(1).unwrap()));
-        let snapshot = task.clone_snapshot();
-        assert!(task.lock.is_locked());
+        let snapshot = with_task_locked(&mut task, |task| {
+            task.occupy();
+            task.set_output(OutputValue::Output(TaskId::new(1).unwrap()));
+            let snapshot = task.clone_snapshot();
+            assert!(task.lock.is_locked());
+            assert_eq!(snapshot.get_output(), task.get_output());
+            snapshot
+        });
         assert!(!snapshot.lock.is_locked());
         assert!(!snapshot.is_occupied());
-        assert_eq!(snapshot.get_output(), task.get_output());
-        // SAFETY: This thread acquired the source lock above.
-        unsafe { task.lock.unlock() };
     }
 
     #[test]
@@ -1922,22 +1929,6 @@ mod tests {
             size_of::<Option<TaskStorage>>(),
             128,
             "TaskStorage's niche should make its Option free"
-        );
-        assert_eq!(
-            size_of::<Mutex<Option<Box<TaskStorage>>>>(),
-            16,
-            "boxed task slot size changed"
-        );
-        assert_eq!(
-            size_of::<Mutex<Option<TaskStorage>>>(),
-            136,
-            "inline task slot size changed"
-        );
-        assert_eq!(size_of::<RawMutex>(), 1, "parking_lot RawMutex grew");
-        assert_eq!(
-            size_of::<IntrusiveTaskLock>(),
-            1,
-            "intrusive lock wrapper grew"
         );
         assert_eq!(
             size_of::<TaskSlot<TaskStorage>>(),

@@ -10,9 +10,7 @@ use std::{
 };
 
 use criterion::{BenchmarkId, Criterion, Throughput};
-use parking_lot::{
-    MappedMutexGuard, Mutex, MutexGuard, RawMutex, lock_api::RawMutex as RawMutexTrait,
-};
+use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use turbo_tasks::{FxDashMap, TaskId};
 use turbo_tasks_malloc::TurboMalloc;
 
@@ -29,7 +27,7 @@ const SPARSE_TASKS: u32 = LOOKUP_TASKS / 10;
 struct Payload {
     niche: NonZeroU64,
     data: [u64; 14],
-    lock: RawMutex,
+    lock: Mutex<()>,
     occupied: bool,
 }
 
@@ -38,7 +36,7 @@ impl Payload {
         Self {
             niche: NonZeroU64::new(id as u64).unwrap(),
             data: [0; 14],
-            lock: <RawMutex as RawMutexTrait>::INIT,
+            lock: Mutex::new(()),
             occupied: false,
         }
     }
@@ -59,17 +57,14 @@ unsafe impl TaskSlotValue for Payload {
     const EMPTY: Self = Self {
         niche: NonZeroU64::MIN,
         data: [0; 14],
-        lock: <RawMutex as RawMutexTrait>::INIT,
+        lock: Mutex::new(()),
         occupied: false,
     };
 
-    fn lock(&self) {
-        self.lock.lock();
-    }
+    type Guard<'a> = MutexGuard<'a, ()>;
 
-    unsafe fn unlock(&self) {
-        // SAFETY: Forwarded from TaskMap's owning guard.
-        unsafe { self.lock.unlock() };
+    fn lock(&self) -> Self::Guard<'_> {
+        self.lock.lock()
     }
 
     fn is_occupied(&self) -> bool {
@@ -84,7 +79,7 @@ unsafe impl TaskSlotValue for Payload {
         let detached = Self {
             niche: self.niche,
             data: self.data,
-            lock: <RawMutex as RawMutexTrait>::INIT,
+            lock: Mutex::new(()),
             occupied: false,
         };
         self.niche = NonZeroU64::MIN;

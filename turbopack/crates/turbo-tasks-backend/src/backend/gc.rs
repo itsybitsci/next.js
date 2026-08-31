@@ -437,6 +437,8 @@ impl TurboTasksBackend {
             && let Err(err) = self.backing_storage.save_snapshot(
                 Vec::new(),
                 Some(roots),
+                // This hook runs no eviction, so it frees no ids to persist.
+                None,
                 Vec::<Vec<SnapshotItem>>::new(),
             )
         {

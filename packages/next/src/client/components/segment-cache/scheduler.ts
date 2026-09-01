@@ -1267,14 +1267,16 @@ function isShellEntryEligibleForStaticAttempt(
   tree: RouteTree<null>,
   fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
 ): boolean {
-  if (
-    (entry.fetchStrategy !== FetchStrategy.StaticShell &&
-      entry.fetchStrategy !== FetchStrategy.RuntimeShell) ||
-    !segmentCanUseStaticRequest(fetchStrategy, tree) ||
-    // A StaticShell walk's static attempt is the shell tier itself, so it
-    // only applies when the walk's static strategy outranks the entry.
-    !canNewFetchStrategyProvideMoreContent(entry.fetchStrategy, fetchStrategy)
-  ) {
+  const staticRequestCanProvideMoreContent =
+    (entry.fetchStrategy === FetchStrategy.StaticShell ||
+      entry.fetchStrategy === FetchStrategy.RuntimeShell) &&
+    segmentCanUseStaticRequest(fetchStrategy, tree) &&
+    // This is a shell that came from a static request.
+    // if the `fetchStrategy` is `FetchStrategy.PPR`, it might provide more content
+    // (e.g. static params that this shell doesn't have)
+    canNewFetchStrategyProvideMoreContent(entry.fetchStrategy, fetchStrategy)
+
+  if (!staticRequestCanProvideMoreContent) {
     return false
   }
   const revalidatingEntry = readOrCreateRevalidatingSegmentEntry(

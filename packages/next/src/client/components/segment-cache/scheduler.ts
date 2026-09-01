@@ -944,7 +944,7 @@ function pingRootRouteTree(
           // actually need a runtime request — registered directly, or only
           // as the fallback after an insufficient static attempt — was
           // decided there.
-          if (walkCanUseRuntimeRequests(staticWalkStrategy, route)) {
+          if (walkRequiresRuntimeCompleteness(staticWalkStrategy, route)) {
             const runtimeStrategy =
               staticWalkStrategy === FetchStrategy.StaticShell
                 ? FetchStrategy.RuntimeShell
@@ -1093,7 +1093,7 @@ function pingStaticHead(
   // as the route's segments: during a StaticShell walk, and during any walk
   // of a Partial Prefetching route, the head needs a response at least as
   // complete as a runtime one.
-  const headCanUseRuntimeRequests = walkCanUseRuntimeRequests(
+  const headCanUseRuntimeRequests = walkRequiresRuntimeCompleteness(
     fetchStrategy,
     route
   )
@@ -1162,7 +1162,7 @@ function pingStaticHead(
  * Routes without Partial Prefetching never use runtime requests for prefetches
  * (excluding `Full` prefetches)
  */
-function walkCanUseRuntimeRequests(
+function walkRequiresRuntimeCompleteness(
   staticWalkStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell,
   route: FulfilledRouteCacheEntry
 ): boolean {
@@ -1497,7 +1497,10 @@ function pingNewPartOfCacheComponentsTree(
 
   // Constant for the whole pass; recomputed here only because the walk is
   // recursive and the check is cheap.
-  const canUseRuntimeRequests = walkCanUseRuntimeRequests(fetchStrategy, route)
+  const canUseRuntimeRequests = walkRequiresRuntimeCompleteness(
+    fetchStrategy,
+    route
+  )
 
   // A force-disabled segment deliberately does NOT deopt here: disabling
   // prefetch is passive. It never initiates a request — its accumulation
@@ -2320,7 +2323,7 @@ function pingSegmentBundle(
         const willBeSupersededByRuntimeRequest =
           runtimeWouldProvideMore &&
           !shellEntryEligibleForStaticAttempt &&
-          walkCanUseRuntimeRequests(fetchStrategy, route)
+          walkRequiresRuntimeCompleteness(fetchStrategy, route)
 
         // Check if we should attempt to upgrade a fallback ISR response to
         // a concrete version.

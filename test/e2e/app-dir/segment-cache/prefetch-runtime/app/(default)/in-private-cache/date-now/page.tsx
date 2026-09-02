@@ -3,7 +3,6 @@ import { cachedDelay, DebugRenderKind, uncachedIO } from '../../../shared'
 import { connection } from 'next/server'
 
 export const instant = true
-export const prefetch = 'partial'
 
 export default async function Page() {
   return (

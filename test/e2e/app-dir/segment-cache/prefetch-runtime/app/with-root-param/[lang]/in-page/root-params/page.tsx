@@ -3,15 +3,16 @@ import { cachedDelay, DebugRenderKind, uncachedIO } from '../../../../shared'
 import { connection } from 'next/server'
 import { lang } from 'next/root-params'
 import { cookies } from 'next/headers'
+import { ForceRuntimeShell } from '../../../../../components/force-runtime-shell'
 
 export const instant = {
   unstable_samples: [{ params: { lang: 'en' } }],
 }
-export const prefetch = 'partial'
 
 export default async function Page() {
   return (
     <main>
+      <ForceRuntimeShell />
       <DebugRenderKind />
       <p>
         This page uses root params and some uncached IO. Root params should

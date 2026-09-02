@@ -50,7 +50,7 @@ describe('runtime prefetching', () => {
           page = p
         },
       })
-      const act = createRouterAct(page)
+      const act = createRouterAct(page, { includeAppShellRequests: true })
 
       // Reveal the link to trigger a runtime prefetch for one value of the dynamic param
       await act(async () => {
@@ -62,6 +62,7 @@ describe('runtime prefetching', () => {
         // Should allow reading dynamic params
         {
           includes: 'Param: 123',
+          kind: 'runtime',
         },
         // Should not prefetch the dynamic content
         {
@@ -80,6 +81,7 @@ describe('runtime prefetching', () => {
         // Should allow reading dynamic params
         {
           includes: 'Param: 456',
+          kind: 'runtime',
         },
         // Should not prefetch the dynamic content
         {
@@ -152,7 +154,7 @@ describe('runtime prefetching', () => {
           page = p
         },
       })
-      const act = createRouterAct(page)
+      const act = createRouterAct(page, { includeAppShellRequests: true })
 
       // Reveal the link to trigger a runtime prefetch for one value of the root param
       await act(async () => {
@@ -164,6 +166,7 @@ describe('runtime prefetching', () => {
         // Should allow reading root params
         {
           includes: 'Lang: en',
+          kind: 'runtime',
         },
         // Should not prefetch the dynamic content
         {
@@ -184,6 +187,7 @@ describe('runtime prefetching', () => {
           // Should allow reading root params
           {
             includes: 'Lang: de',
+            kind: 'runtime',
           },
           // Should not prefetch the dynamic content
           {
@@ -264,7 +268,7 @@ describe('runtime prefetching', () => {
           page = p
         },
       })
-      const act = createRouterAct(page)
+      const act = createRouterAct(page, { includeAppShellRequests: true })
 
       // Reveal the link to trigger a runtime prefetch for one value of the search param
       await act(async () => {
@@ -276,6 +280,7 @@ describe('runtime prefetching', () => {
         // Should allow reading search params
         {
           includes: 'Search param: 123',
+          kind: 'runtime',
         },
         // Should not prefetch the dynamic content
         {
@@ -292,8 +297,15 @@ describe('runtime prefetching', () => {
         await linkToggle.click()
       }, [
         // Should allow reading search params
+        // Shell
         {
           includes: 'Search param: 456',
+          kind: 'runtime',
+        },
+        // PRefetch
+        {
+          includes: 'Search param: 456',
+          kind: 'runtime',
         },
         // Should not prefetch the dynamic content
         {
@@ -360,7 +372,7 @@ describe('runtime prefetching', () => {
           page = p
         },
       })
-      const act = createRouterAct(page)
+      const act = createRouterAct(page, { includeAppShellRequests: true })
 
       // Reveal the link to trigger a runtime prefetch for one value of the search param
       await act(async () => {
@@ -370,8 +382,15 @@ describe('runtime prefetching', () => {
         await linkToggle.click()
       }, [
         // Should allow reading headers
+        // Shell
         {
           includes: 'Header: present',
+          kind: 'runtime',
+        },
+        // Prefetch
+        {
+          includes: 'Header: present',
+          kind: 'runtime',
         },
         // Should not prefetch the dynamic content
         {
@@ -416,7 +435,7 @@ describe('runtime prefetching', () => {
       // Clear cookies after the test. This currently doesn't happen automatically.
       await using _ = defer(() => browser.deleteCookies())
 
-      const act = createRouterAct(page)
+      const act = createRouterAct(page, { includeAppShellRequests: true })
 
       await browser.addCookie({ name: 'testCookie', value: 'initialValue' })
 
@@ -428,8 +447,15 @@ describe('runtime prefetching', () => {
         await linkToggle.click()
       }, [
         // Should allow reading cookies
+        // Shell
         {
           includes: 'Cookie: initialValue',
+          kind: 'runtime',
+        },
+        // Prefetch
+        {
+          includes: 'Cookie: initialValue',
+          kind: 'runtime',
         },
         // Should not prefetch the dynamic content
         {
@@ -524,8 +550,15 @@ describe('runtime prefetching', () => {
         await linkToggle.click()
       }, [
         // Should allow reading cookies in the app shell
+        // Shell
         {
           includes: 'Cookie: initialValue',
+          kind: 'runtime',
+        },
+        // Prefetch
+        {
+          includes: 'Cookie: initialValue',
+          kind: 'runtime',
         },
       ])
 
@@ -578,8 +611,15 @@ describe('runtime prefetching', () => {
           await linkToggle.click()
         }, [
           // Should allow reading cookies
+          // Shell
           {
             includes: 'Cookie: initialValue',
+            kind: 'runtime',
+          },
+          // Prefetch
+          {
+            includes: 'Cookie: initialValue',
+            kind: 'runtime',
           },
         ])
 
@@ -613,7 +653,7 @@ describe('runtime prefetching', () => {
       // Clear cookies after the test. This currently doesn't happen automatically.
       await using _ = defer(() => browser.deleteCookies())
 
-      const act = createRouterAct(page)
+      const act = createRouterAct(page, { includeAppShellRequests: true })
 
       // Reveal the link to trigger the first runtime prefetch
       await act(async () => {
@@ -623,8 +663,15 @@ describe('runtime prefetching', () => {
         await linkToggle.click()
       }, [
         // The timestamp value is in a private cache, so it should be included
+        // Shell
         {
           includes: 'Timestamp: ',
+          kind: 'runtime',
+        },
+        // Prefetch
+        {
+          includes: 'Timestamp: ',
+          kind: 'runtime',
         },
       ])
 
@@ -690,7 +737,7 @@ describe('runtime prefetching', () => {
       },
     })
 
-    const act = createRouterAct(page)
+    const act = createRouterAct(page, { includeAppShellRequests: true })
 
     // Reveal the link to trigger a runtime prefetch for the page
     await act(async () => {
@@ -757,7 +804,7 @@ describe('runtime prefetching', () => {
           page = p
         },
       })
-      const act = createRouterAct(page)
+      const act = createRouterAct(page, { includeAppShellRequests: true })
 
       const DYNAMICALLY_PREFETCHABLE_CONTENT = 'Short-lived cached content'
 
@@ -770,10 +817,12 @@ describe('runtime prefetching', () => {
       }, [
         {
           includes: staticContent,
+          kind: 'runtime',
         },
         // Should include the short-lived cache
         {
           includes: DYNAMICALLY_PREFETCHABLE_CONTENT,
+          kind: 'runtime',
         },
       ])
 
@@ -798,7 +847,7 @@ describe('runtime prefetching', () => {
           page = p
         },
       })
-      const act = createRouterAct(page)
+      const act = createRouterAct(page, { includeAppShellRequests: true })
 
       const STATIC_CONTENT = 'This page uses a short-lived public cache'
       const DYNAMIC_CONTENT = 'Short-lived cached content'
@@ -810,9 +859,15 @@ describe('runtime prefetching', () => {
         )
         await linkToggle.click()
       }, [
-        // Should include the shell
+        // Shell
         {
           includes: STATIC_CONTENT,
+          kind: 'runtime',
+        },
+        // Prefetch
+        {
+          includes: STATIC_CONTENT,
+          kind: 'runtime',
         },
         // Should not include the short-lived cache
         // (We set the `stale` value to be under 30s, so it will be excluded from runtime prerenders)
@@ -859,7 +914,7 @@ describe('runtime prefetching', () => {
           page = p
         },
       })
-      const act = createRouterAct(page)
+      const act = createRouterAct(page, { includeAppShellRequests: true })
 
       const STATIC_CONTENT = 'This page uses a short-lived private cache'
       const DYNAMIC_CONTENT = 'Short-lived cached content'
@@ -871,9 +926,15 @@ describe('runtime prefetching', () => {
         )
         await linkToggle.click()
       }, [
-        // Should include the shell
+        // Shell
         {
           includes: STATIC_CONTENT,
+          kind: 'runtime',
+        },
+        // Prefetch
+        {
+          includes: STATIC_CONTENT,
+          kind: 'runtime',
         },
         // Should not prefetch the short-lived cache
         // (We set the `stale` value to be under 30s, so it will be excluded from runtime prefetches)
@@ -994,7 +1055,7 @@ describe('runtime prefetching', () => {
             page = p
           },
         })
-        const act = createRouterAct(page)
+        const act = createRouterAct(page, { includeAppShellRequests: true })
 
         const STATIC_CONTENT = 'This page performs sync IO after'
 
@@ -1005,9 +1066,15 @@ describe('runtime prefetching', () => {
           )
           await linkToggle.click()
         }, [
-          // Should include the shell
+          // App shell
           {
             includes: STATIC_CONTENT,
+            kind: 'runtime',
+          },
+          // Prefetch
+          {
+            includes: STATIC_CONTENT,
+            kind: 'runtime',
           },
           // Should abort the render when sync IO is encountered,
           // so this should never be included
@@ -1077,6 +1144,7 @@ describe('runtime prefetching', () => {
         // Should include the shell
         {
           includes: STATIC_CONTENT,
+          kind: 'runtime',
         },
       ])
 
